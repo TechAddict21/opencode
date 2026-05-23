@@ -52,7 +52,7 @@ runs:
       id: cache
       uses: actions/cache@v4
       with:
-        path: ~/.opencode/bin
+        path: ~/.noussh/bin
         key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
 
     - name: Install opencode
@@ -62,12 +62,12 @@ runs:
 
     - name: Add opencode to PATH
       shell: bash
-      run: echo "$HOME/.opencode/bin" >> $GITHUB_PATH
+      run: echo "$HOME/.noussh/bin" >> $GITHUB_PATH
 
     - name: Run opencode
       shell: bash
       id: run_opencode
-      run: opencode github run
+      run: nous github run
       env:
         MODEL: ${{ inputs.model }}
         AGENT: ${{ inputs.agent }}

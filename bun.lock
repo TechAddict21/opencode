@@ -195,7 +195,7 @@
       "name": "@opencode-ai/core",
       "version": "1.15.10",
       "bin": {
-        "opencode": "./bin/opencode",
+        "nous": "./bin/nous",
       },
       "dependencies": {
         "@ai-sdk/alibaba": "1.0.17",
@@ -402,7 +402,7 @@
       "name": "opencode",
       "version": "1.15.10",
       "bin": {
-        "opencode": "./bin/opencode",
+        "nous": "./bin/nous",
       },
       "dependencies": {
         "@actions/core": "1.11.1",
