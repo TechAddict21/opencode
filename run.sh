@@ -80,7 +80,6 @@ find_native_binary() {
 # Run in production mode (native binary)
 run_production() {
     if [[ -n "${NATIVE_BINARY}" ]]; then
-        log "Running native binary: ${NATIVE_BINARY}"
         exec "${NATIVE_BINARY}" "$@"
     fi
     
@@ -102,7 +101,6 @@ run_development() {
         exit 1
     fi
     
-    info "Running in development mode via bun..."
     cd "${PACKAGE_DIR}"
     
     # Check if we need to install dependencies

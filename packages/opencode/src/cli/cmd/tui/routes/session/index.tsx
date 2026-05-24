@@ -299,6 +299,18 @@ export function Session() {
     seeded = true
     r.set(route.prompt)
   }
+
+  let autoSubmitted = false
+  createEffect(() => {
+    const r = prompt
+    if (autoSubmitted || !r) return
+    if (!sync.ready || !local.model.ready) return
+    if (!route.prompt) return
+    if (r.current.input !== route.prompt.input) return
+    autoSubmitted = true
+    r.submit()
+  })
+
   const keymap = useOpencodeKeymap()
   const dialog = useDialog()
   const renderer = useRenderer()
@@ -326,20 +338,11 @@ export function Session() {
   const exit = useExit()
 
   createEffect(() => {
-    const title = Locale.truncate(session()?.title ?? "", 50)
     const pad = (text: string) => text.padEnd(10, " ")
     const weak = (text: string) => UI.Style.TEXT_DIM + pad(text) + UI.Style.TEXT_NORMAL
-    const logo = UI.logo("  ").split(/\r?\n/)
     return exit.message.set(
       [
-        `${logo[0] ?? ""}`,
-        `${logo[1] ?? ""}`,
-        `${logo[2] ?? ""}`,
-        `${logo[3] ?? ""}`,
-        ``,
-        `  ${weak("Session")}${UI.Style.TEXT_NORMAL_BOLD}${title}${UI.Style.TEXT_NORMAL}`,
-        `  ${weak("Continue")}${UI.Style.TEXT_NORMAL_BOLD}opencode -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
-        ``,
+        `${weak("Continue anytime by running")}${UI.Style.TEXT_NORMAL_BOLD}nous -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
       ].join("\n"),
     )
   })
@@ -440,9 +443,6 @@ export function Session() {
       suggested: route.type === "session",
       category: "Session",
       enabled: sync.data.config.share !== "disabled",
-      slash: {
-        name: "share",
-      },
       run: async () => {
         const copy = (url: string) =>
           Clipboard.copy(url)
@@ -488,9 +488,6 @@ export function Session() {
       title: "Jump to message",
       value: "session.timeline",
       category: "Session",
-      slash: {
-        name: "timeline",
-      },
       run: () => {
         dialog.replace(() => (
           <DialogTimeline
@@ -510,9 +507,6 @@ export function Session() {
       title: "Fork session",
       value: "session.fork",
       category: "Session",
-      slash: {
-        name: "fork",
-      },
       run: () => {
         dialog.replace(() => (
           <DialogForkFromTimeline
@@ -653,10 +647,6 @@ export function Session() {
       title: showTimestamps() ? "Hide timestamps" : "Show timestamps",
       value: "session.toggle.timestamps",
       category: "Session",
-      slash: {
-        name: "timestamps",
-        aliases: ["toggle-timestamps"],
-      },
       run: () => {
         setTimestamps((prev) => (prev === "show" ? "hide" : "show"))
         dialog.clear()
@@ -877,9 +867,6 @@ export function Session() {
       title: "Copy session transcript",
       value: "session.copy",
       category: "Session",
-      slash: {
-        name: "copy",
-      },
       run: async () => {
         try {
           const sessionData = session()
@@ -907,9 +894,6 @@ export function Session() {
       title: "Export session transcript",
       value: "session.export",
       category: "Session",
-      slash: {
-        name: "export",
-      },
       run: async () => {
         try {
           const sessionData = session()

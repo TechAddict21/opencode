@@ -38,7 +38,6 @@ import { useConnected } from "@tui/component/use-connected"
 import { DialogMcp } from "@tui/component/dialog-mcp"
 import { DialogStatus } from "@tui/component/dialog-status"
 import { DialogThemeList } from "@tui/component/dialog-theme-list"
-import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "@tui/component/dialog-agent"
 import { DialogSessionList } from "@tui/component/dialog-session-list"
 import { DialogConsoleOrg } from "@tui/component/dialog-console-org"
@@ -66,9 +65,7 @@ import { createTuiApi } from "@/cli/cmd/tui/plugin/api"
 import type { RouteMap } from "@/cli/cmd/tui/plugin/api"
 import { createTuiAttention } from "@/cli/cmd/tui/attention"
 import { FormatError, FormatUnknownError } from "@/cli/error"
-import { CommandPaletteDialog } from "./component/command-palette"
 import {
-  COMMAND_PALETTE_COMMAND,
   OPENCODE_BASE_MODE,
   OpencodeKeymapProvider,
   registerOpencodeKeymap,
@@ -80,7 +77,6 @@ import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
 
 const appBindingCommands = [
-  "command.palette.show",
   "session.list",
   "session.new",
   "session.quick_switch.1",
@@ -109,7 +105,6 @@ const appBindingCommands = [
   "theme.switch",
   "theme.switch_mode",
   "theme.mode.lock",
-  "help.show",
   "docs.open",
   "app.debug",
   "app.console",
@@ -436,6 +431,37 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     })
   })
 
+  createEffect(() => {
+    if (!ready() || route.data.type !== "home") return
+    if (args.continue || args.sessionID) return
+    if (!sync.ready || !local.model.ready) return
+
+    const agent = local.agent.current()
+    const model = local.model.current()
+    if (!agent || !model) return
+
+    const variant = local.model.variant.current()
+
+    void sdk.client.session
+      .create({
+        agent: agent.name,
+        model: {
+          providerID: model.providerID,
+          id: model.modelID,
+          variant,
+        },
+      })
+      .then((result) => {
+        if (result.data?.id) {
+          route.navigate({
+            type: "session",
+            sessionID: result.data.id,
+            prompt: args.prompt ? { input: args.prompt, parts: [] } : undefined,
+          })
+        }
+      })
+  })
+
   createEffect(
     on(
       () => sync.status === "complete" && sync.data.provider.length === 0,
@@ -458,21 +484,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
   const appCommands = createMemo(() =>
     [
       {
-        name: COMMAND_PALETTE_COMMAND,
-        title: "Show command palette",
-        category: "System",
-        hidden: true,
-        run: () => {
-          dialog.replace(() => <CommandPaletteDialog />)
-        },
-      },
-      {
         name: "session.list",
         title: "Switch session",
         category: "Session",
         suggested: sync.data.session.length > 0,
-        slashName: "sessions",
-        slashAliases: ["resume", "continue"],
         run: () => {
           dialog.replace(() => <DialogSessionList />)
         },
@@ -482,8 +497,6 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         title: "New session",
         suggested: route.data.type === "session",
         category: "Session",
-        slashName: "new",
-        slashAliases: ["clear"],
         run: () => {
           route.navigate({
             type: "home",
@@ -642,7 +655,6 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       {
         name: "opencode.status",
         title: "View status",
-        slashName: "status",
         run: () => {
           dialog.replace(() => <DialogStatus />)
         },
@@ -677,15 +689,6 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "System",
       },
       {
-        name: "help.show",
-        title: "Help",
-        slashName: "help",
-        run: () => {
-          dialog.replace(() => <DialogHelp />)
-        },
-        category: "System",
-      },
-      {
         name: "docs.open",
         title: "Open docs",
         run: () => {
@@ -697,8 +700,6 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       {
         name: "app.exit",
         title: "Exit the app",
-        slashName: "exit",
-        slashAliases: ["quit", "q"],
         run: () => exit(),
         category: "System",
       },

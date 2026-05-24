@@ -3,7 +3,6 @@ import type { TuiCommand, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { TuiKeybind } from "../config/keybind"
 import type { DialogContext } from "../ui/dialog"
 
-const COMMAND_PALETTE_SHOW = "command.palette.show"
 const warned = new Set<string>()
 
 type Warn = (api: string, replacement: string) => void
@@ -102,8 +101,7 @@ export function createCommandShim(
       keymap.dispatchCommand(value)
     },
     show() {
-      warnOnce("api.command.show", `api.keymap.dispatchCommand("${COMMAND_PALETTE_SHOW}")`, warnCommandShim)
-      keymap.dispatchCommand(COMMAND_PALETTE_SHOW)
+      warnOnce("api.command.show", "api.keymap.dispatchCommand(name)", warnCommandShim)
     },
   }
 }

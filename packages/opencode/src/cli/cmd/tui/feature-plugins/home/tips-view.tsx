@@ -12,9 +12,6 @@ type Shortcuts = {
   childFirst: TipShortcut
   childNext: TipShortcut
   childPrevious: TipShortcut
-  commandList: TipShortcut
-  editorOpen: TipShortcut
-  helpShow: TipShortcut
   inputClear: TipShortcut
   inputNewline: TipShortcut
   inputPaste: TipShortcut
@@ -28,17 +25,12 @@ type Shortcuts = {
   messagesToggleConceal: TipShortcut
   modelCycleRecent: TipShortcut
   modelList: TipShortcut
-  sessionExport: TipShortcut
   sessionInterrupt: TipShortcut
-  sessionList: TipShortcut
-  sessionNew: TipShortcut
   sessionParent: TipShortcut
   sessionPinToggle: TipShortcut
   sessionQuickSwitch1: TipShortcut
   sessionQuickSwitch9: TipShortcut
   sessionSidebarToggle: TipShortcut
-  sessionTimeline: TipShortcut
-  statusView: TipShortcut
   terminalSuspend: TipShortcut
   themeList: TipShortcut
 }
@@ -102,9 +94,6 @@ export function Tips(props: { api: TuiPluginApi; connected?: boolean }) {
     childFirst: configShortcut(props.api, "session.child.first"),
     childNext: configShortcut(props.api, "session.child.next"),
     childPrevious: configShortcut(props.api, "session.child.previous"),
-    commandList: useCommandShortcut("command.palette.show"),
-    editorOpen: useCommandShortcut("prompt.editor"),
-    helpShow: useCommandShortcut("help.show"),
     inputClear: useCommandShortcut("prompt.clear"),
     inputNewline: useCommandShortcut("input.newline"),
     inputPaste: useCommandShortcut("prompt.paste"),
@@ -118,17 +107,12 @@ export function Tips(props: { api: TuiPluginApi; connected?: boolean }) {
     messagesToggleConceal: configShortcut(props.api, "session.toggle.conceal"),
     modelCycleRecent: useCommandShortcut("model.cycle_recent"),
     modelList: useCommandShortcut("model.list"),
-    sessionExport: configShortcut(props.api, "session.export"),
     sessionInterrupt: configShortcut(props.api, "session.interrupt"),
-    sessionList: useCommandShortcut("session.list"),
-    sessionNew: useCommandShortcut("session.new"),
     sessionParent: configShortcut(props.api, "session.parent"),
     sessionPinToggle: configShortcut(props.api, "session.pin.toggle"),
     sessionQuickSwitch1: useCommandShortcut("session.quick_switch.1"),
     sessionQuickSwitch9: useCommandShortcut("session.quick_switch.9"),
     sessionSidebarToggle: configShortcut(props.api, "session.sidebar.toggle"),
-    sessionTimeline: configShortcut(props.api, "session.timeline"),
-    statusView: useCommandShortcut("opencode.status"),
     terminalSuspend: useCommandShortcut("terminal.suspend"),
     themeList: useCommandShortcut("theme.switch"),
   }
@@ -167,24 +151,17 @@ const TIPS: Tip[] = [
   (shortcuts) => press(shortcuts.agentCycle(), "to cycle between Build and Plan agents"),
   "Use {highlight}/undo{/highlight} to revert the last message and file changes",
   "Use {highlight}/redo{/highlight} to restore previously undone messages and file changes",
-  "Run {highlight}/share{/highlight} to create a public link to your conversation at opencode.ai",
   "Drag and drop images or PDFs into the terminal to add them as context",
   (shortcuts) => press(shortcuts.inputPaste(), "to paste images from your clipboard into the prompt"),
-  (shortcuts) => `Use ${commandText("/editor", shortcuts.editorOpen())} to compose messages in your external editor`,
   "Run {highlight}/init{/highlight} to auto-generate project rules based on your codebase",
   (shortcuts) => `Use ${commandText("/models", shortcuts.modelList())} to see and switch between available AI models`,
   (shortcuts) => `Use ${commandText("/themes", shortcuts.themeList())} to switch between ${themeCount} built-in themes`,
-  (shortcuts) => `Use ${commandText("/new", shortcuts.sessionNew())} to start a fresh conversation session`,
-  (shortcuts) => `Use ${commandText("/sessions", shortcuts.sessionList())} to list, pin, and continue sessions`,
   (shortcuts) => press(shortcuts.sessionPinToggle(), "in the session list to pin a session so it stays at the top"),
   (shortcuts) =>
     shortcuts.sessionQuickSwitch1() && shortcuts.sessionQuickSwitch9()
       ? `Pinned sessions are assigned quick slots; use ${shortcutText(shortcuts.sessionQuickSwitch1())} through ${shortcutText(shortcuts.sessionQuickSwitch9())} to switch`
       : undefined,
-  "Run {highlight}/compact{/highlight} to summarize long sessions near context limits",
-  (shortcuts) => `Use ${commandText("/export", shortcuts.sessionExport())} to save the conversation as Markdown`,
   (shortcuts) => press(shortcuts.messagesCopy(), "to copy the assistant's last message to clipboard"),
-  (shortcuts) => press(shortcuts.commandList(), "to see all available actions and commands"),
   "Run {highlight}/connect{/highlight} to add API keys for 75+ supported LLM providers",
   (shortcuts) => `The leader key is ${shortcutText(shortcuts.leader())}; combine with other keys for quick actions`,
   (shortcuts) => press(shortcuts.modelCycleRecent(), "to quickly switch between recently used models"),
@@ -261,24 +238,16 @@ const TIPS: Tip[] = [
   "Override global tool settings per agent configuration",
   'Set {highlight}"share": "auto"{/highlight} to automatically share all sessions',
   'Set {highlight}"share": "disabled"{/highlight} to prevent any session sharing',
-  "Run {highlight}/unshare{/highlight} to remove a session from public access",
   "Permission {highlight}doom_loop{/highlight} prevents infinite tool call loops",
   "Permission {highlight}external_directory{/highlight} protects files outside project",
   "Run {highlight}opencode debug config{/highlight} to troubleshoot configuration",
   "Use {highlight}--print-logs{/highlight} flag to see detailed logs in stderr",
-  (shortcuts) => `Use ${commandText("/timeline", shortcuts.sessionTimeline())} to jump to specific messages`,
   (shortcuts) => press(shortcuts.messagesToggleConceal(), "to toggle code block visibility in messages"),
-  (shortcuts) => `Use ${commandText("/status", shortcuts.statusView())} to see system status info`,
   "Enable {highlight}scroll_acceleration{/highlight} in {highlight}tui.json{/highlight} for smooth macOS-style scrolling",
-  (shortcuts) =>
-    shortcuts.commandList()
-      ? `Toggle username display in chat via the command palette (${shortcutText(shortcuts.commandList())})`
-      : "Toggle username display in chat via the command palette",
   "Run {highlight}docker run -it --rm ghcr.io/anomalyco/opencode{/highlight} for containerized use",
   "Use {highlight}/connect{/highlight} with OpenCode Zen for curated, tested models",
   "Commit your project's {highlight}AGENTS.md{/highlight} file to Git for team sharing",
   "Use {highlight}/review{/highlight} to review uncommitted changes, branches, or PRs",
-  (shortcuts) => `Use ${commandText("/help", shortcuts.helpShow())} to show the help dialog`,
   "Use {highlight}/rename{/highlight} to rename the current session",
   ...(process.platform === "win32"
     ? ([(shortcuts) => press(shortcuts.inputUndo(), "to undo changes in your prompt")] satisfies Tip[])
