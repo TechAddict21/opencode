@@ -13,7 +13,7 @@ export default createHandler(
         const locale = evt ? localeFromRequest(evt.request) : "en"
 
         return (
-          <html lang={tag(locale)} dir={dir(locale)} data-locale={locale}>
+          <html lang={tag(locale)} dir={"ltr" as const} data-locale={locale}>
             <head>
               <meta charset="utf-8" />
               <meta name="viewport" content="width=device-width, initial-scale=1" />

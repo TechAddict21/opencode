@@ -64,7 +64,7 @@ import { ConstrainDragXAxis, getDraggableId } from "@/utils/solid-dnd"
 import { DebugBar } from "@/components/debug-bar"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
 import { useServer } from "@/context/server"
-import { useLanguage, type Locale } from "@/context/language"
+import { useLanguage } from "@/context/language"
 import { pathKey } from "@/utils/path-key"
 import {
   displayName,
@@ -376,24 +376,6 @@ export default function Layout(props: ParentProps) {
       title: language.t("toast.scheme.title"),
       description: colorSchemeLabel(next),
     })
-  }
-
-  function setLocale(next: Locale) {
-    if (next === language.locale()) return
-    language.setLocale(next)
-    showToast({
-      title: language.t("toast.language.title"),
-      description: language.t("toast.language.description", { language: language.label(next) }),
-    })
-  }
-
-  function cycleLanguage(direction = 1) {
-    const locales = language.locales
-    const currentIndex = locales.indexOf(language.locale())
-    const nextIndex = currentIndex === -1 ? 0 : (currentIndex + direction + locales.length) % locales.length
-    const next = locales[nextIndex]
-    if (!next) return
-    setLocale(next)
   }
 
   const useSDKNotificationToasts = () =>
@@ -1188,22 +1170,6 @@ export default function Layout(props: ParentProps) {
           theme.previewColorScheme(scheme)
           return () => theme.cancelPreview()
         },
-      })
-    }
-
-    commands.push({
-      id: "language.cycle",
-      title: language.t("command.language.cycle"),
-      category: language.t("command.category.language"),
-      onSelect: () => cycleLanguage(1),
-    })
-
-    for (const locale of language.locales) {
-      commands.push({
-        id: `language.set.${locale}`,
-        title: language.t("command.language.set", { language: language.label(locale) }),
-        category: language.t("command.category.language"),
-        onSelect: () => setLocale(locale),
       })
     }
 
