@@ -8,18 +8,18 @@ import type {
   TuiAttentionSoundName,
   TuiAttentionSoundPack,
   TuiAttentionSoundPackInfo,
-} from "@opencode-ai/plugin/tui"
+} from "@nous-ai/plugin/tui"
 import stripAnsi from "strip-ansi"
 import type { TuiConfig } from "./config/tui"
 import { isAttentionSoundName } from "./config/tui-schema"
 import * as TuiAudio from "@tui/util/audio"
-import defaultSoundPath from "@opencode-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
-import questionSoundPath from "@opencode-ai/ui/audio/bip-bop-03.mp3" with { type: "file" }
-import permissionSoundPath from "@opencode-ai/ui/audio/staplebops-06.mp3" with { type: "file" }
-import errorSoundPath from "@opencode-ai/ui/audio/nope-03.mp3" with { type: "file" }
-import doneSoundPath from "@opencode-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
-import subagentDoneSoundPath from "@opencode-ai/ui/audio/yup-01.mp3" with { type: "file" }
-import * as Log from "@opencode-ai/core/util/log"
+import defaultSoundPath from "@nous-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
+import questionSoundPath from "@nous-ai/ui/audio/bip-bop-03.mp3" with { type: "file" }
+import permissionSoundPath from "@nous-ai/ui/audio/staplebops-06.mp3" with { type: "file" }
+import errorSoundPath from "@nous-ai/ui/audio/nope-03.mp3" with { type: "file" }
+import doneSoundPath from "@nous-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
+import subagentDoneSoundPath from "@nous-ai/ui/audio/yup-01.mp3" with { type: "file" }
+import * as Log from "@nous-ai/core/util/log"
 
 type FocusState = "unknown" | "focused" | "blurred"
 
@@ -40,8 +40,8 @@ type TuiAttentionHost = TuiAttention & {
 
 const log = Log.create({ service: "tui.attention" })
 
-const DEFAULT_TITLE = "opencode"
-const DEFAULT_PACK_ID = "opencode.default"
+const DEFAULT_TITLE = "nous"
+const DEFAULT_PACK_ID = "nous.default"
 const KV_SOUND_PACK = "attention_sound_pack"
 const TITLE_LIMIT = 80
 const MESSAGE_LIMIT = 240

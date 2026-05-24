@@ -32,7 +32,7 @@ import type {
   UserMessage,
   TextPart,
   ReasoningPart,
-} from "@opencode-ai/sdk/v2"
+} from "@nous-ai/sdk/v2"
 import { useLocal } from "@tui/context/local"
 import { Locale } from "@/util/locale"
 import type { Tool } from "@/tool/tool"
@@ -342,7 +342,7 @@ export function Session() {
     const weak = (text: string) => UI.Style.TEXT_DIM + pad(text) + UI.Style.TEXT_NORMAL
     return exit.message.set(
       [
-        `${weak("Continue anytime by running")}${UI.Style.TEXT_NORMAL_BOLD}nous -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
+        `${weak("Continue anytime by running ")}${UI.Style.TEXT_NORMAL_BOLD}nous -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
       ].join("\n"),
     )
   })

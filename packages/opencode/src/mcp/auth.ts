@@ -1,8 +1,8 @@
 import path from "path"
 import { serviceUse } from "@/effect/service-use"
-import { Global } from "@opencode-ai/core/global"
+import { Global } from "@nous-ai/core/global"
 import { Effect, Layer, Context, Option, Schema } from "effect"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { AppFileSystem } from "@nous-ai/core/filesystem"
 
 export const Tokens = Schema.Struct({
   accessToken: Schema.mutableKey(Schema.String),

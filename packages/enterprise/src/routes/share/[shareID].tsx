@@ -1,31 +1,31 @@
-import { Message, Model, Part, Session, SessionStatus, SnapshotFileDiff, UserMessage } from "@opencode-ai/sdk/v2"
-import { SessionTurn } from "@opencode-ai/ui/session-turn"
-import { SessionReview } from "@opencode-ai/ui/session-review"
-import { DataProvider } from "@opencode-ai/ui/context"
-import { FileComponentProvider } from "@opencode-ai/ui/context/file"
-import { WorkerPoolProvider } from "@opencode-ai/ui/context/worker-pool"
+import { Message, Model, Part, Session, SessionStatus, SnapshotFileDiff, UserMessage } from "@nous-ai/sdk/v2"
+import { SessionTurn } from "@nous-ai/ui/session-turn"
+import { SessionReview } from "@nous-ai/ui/session-review"
+import { DataProvider } from "@nous-ai/ui/context"
+import { FileComponentProvider } from "@nous-ai/ui/context/file"
+import { WorkerPoolProvider } from "@nous-ai/ui/context/worker-pool"
 import { createAsync, query, useParams } from "@solidjs/router"
 import { createMemo, createSignal, ErrorBoundary, For, Match, Show, Switch } from "solid-js"
 import { Share } from "~/core/share"
-import { Logo, Mark } from "@opencode-ai/ui/logo"
-import { IconButton } from "@opencode-ai/ui/icon-button"
-import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
-import { iife } from "@opencode-ai/core/util/iife"
-import { Binary } from "@opencode-ai/core/util/binary"
-import { NamedError } from "@opencode-ai/core/util/error"
+import { Mark } from "@nous-ai/ui/logo"
+import { IconButton } from "@nous-ai/ui/icon-button"
+import { ProviderIcon } from "@nous-ai/ui/provider-icon"
+import { iife } from "@nous-ai/core/util/iife"
+import { Binary } from "@nous-ai/core/util/binary"
+import { NamedError } from "@nous-ai/core/util/error"
 import { DateTime } from "luxon"
 import { createStore } from "solid-js/store"
 import NotFound from "../[...404]"
-import { Tabs } from "@opencode-ai/ui/tabs"
-import { MessageNav } from "@opencode-ai/ui/message-nav"
-import { FileSSR } from "@opencode-ai/ui/file-ssr"
+import { Tabs } from "@nous-ai/ui/tabs"
+import { MessageNav } from "@nous-ai/ui/message-nav"
+import { FileSSR } from "@nous-ai/ui/file-ssr"
 import { clientOnly } from "@solidjs/start"
 import { Meta, Title } from "@solidjs/meta"
 import { Base64 } from "js-base64"
 import { getRequestEvent } from "solid-js/web"
 
 const ClientOnlyWorkerPoolProvider = clientOnly(() =>
-  import("@opencode-ai/ui/pierre/worker").then((m) => ({
+  import("@nous-ai/ui/pierre/worker").then((m) => ({
     default: (props: { children: any }) => (
       <WorkerPoolProvider pools={m.getWorkerPools()}>{props.children}</WorkerPoolProvider>
     ),
@@ -262,9 +262,6 @@ export default function () {
                               )}
                             </For>
                           </div>
-                          <div class="px-4 flex items-center justify-center pt-20 pb-8 shrink-0">
-                            <Logo class="w-58.5 opacity-12" />
-                          </div>
                         </div>
                       )
 
@@ -340,9 +337,6 @@ export default function () {
                                       container: "w-full pb-20 px-6",
                                     }}
                                   >
-                                    <div classList={{ "w-full flex items-center justify-center pb-8 shrink-0": true }}>
-                                      <Logo class="w-58.5 opacity-12" />
-                                    </div>
                                   </SessionTurn>
                                 </div>
                               </div>
