@@ -1376,14 +1376,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
-      <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
-        <box paddingTop={1} paddingLeft={3}>
-          <text fg={theme.text}>
-            {childShortcut()}
-            <span style={{ fg: theme.textMuted }}> view subagents</span>
-          </text>
-        </box>
-      </Show>
       <Show when={props.message.error && props.message.error.name !== "MessageAbortedError"}>
         <box
           border={["left"]}

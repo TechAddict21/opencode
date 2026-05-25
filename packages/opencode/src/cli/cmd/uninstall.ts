@@ -24,7 +24,7 @@ interface RemovalTargets {
 
 export const UninstallCommand = {
   command: "uninstall",
-  describe: "uninstall opencode and remove all related files",
+  describe: "uninstall nous and remove all related files",
   builder: (yargs: Argv) =>
     yargs
       .option("keep-config", {
@@ -229,7 +229,7 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
   }
 
   UI.empty()
-  prompts.log.success("Thank you for using OpenCode!")
+  prompts.log.success("Thank you for using Nous!")
 }
 
 async function getShellConfigFile(): Promise<string | null> {

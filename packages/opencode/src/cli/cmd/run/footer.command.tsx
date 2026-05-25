@@ -316,20 +316,6 @@ export function RunCommandMenuBody(props: {
         category: "Suggested",
         display: "Switch model",
       },
-      ...(props.subagents().length > 0
-        ? [
-            {
-              action: "subagent" as const,
-              category: "Suggested",
-              display: "View subagents",
-              footer: `${props.subagents().length} active`,
-              keywords: props
-                .subagents()
-                .map((item) => `${item.label} ${item.description} ${item.title ?? ""}`)
-                .join(" "),
-            },
-          ]
-        : []),
       {
         action: "variant.cycle",
         category: "Suggested",

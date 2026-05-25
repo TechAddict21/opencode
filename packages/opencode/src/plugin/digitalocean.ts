@@ -69,7 +69,7 @@ const HTML_CALLBACK = `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>OpenCode - DigitalOcean Authorization</title>
+    <title>Nous - DigitalOcean Authorization</title>
     <style>
       body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0b1220; color: #e8eef9; }
       .container { text-align: center; padding: 2rem; max-width: 32rem; }
@@ -107,7 +107,7 @@ const HTML_CALLBACK = `<!doctype html>
             return
           }
           titleEl.textContent = "Authorization Successful"
-          msgEl.textContent = "You can close this window and return to OpenCode."
+          msgEl.textContent = "You can close this window and return to Nous."
           setTimeout(function () { window.close() }, 2000)
         } catch (e) {
           titleEl.textContent = "Authorization Failed"
