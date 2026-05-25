@@ -401,31 +401,46 @@ export const RunCommand = effectCmd({
             })
             .catch(() => undefined)
 
-          if (!current?.data) {
-            UI.error("Session not found")
-            process.exit(1)
-          }
+          if (current?.data) {
+            if (args.fork) {
+              const forked = await sdk.session.fork({
+                sessionID: args.session,
+              })
+              const id = forked.data?.id
+              if (!id) {
+                return
+              }
 
-          if (args.fork) {
-            const forked = await sdk.session.fork({
-              sessionID: args.session,
-            })
-            const id = forked.data?.id
-            if (!id) {
-              return
+              return {
+                id,
+                title: forked.data?.title ?? current.data.title,
+                directory: forked.data?.directory ?? current.data.directory,
+              }
             }
 
             return {
-              id,
-              title: forked.data?.title ?? current.data.title,
-              directory: forked.data?.directory ?? current.data.directory,
+              id: current.data.id,
+              title: current.data.title,
+              directory: current.data.directory,
             }
           }
 
+          // Session not found — create a new one with the requested ID
+          const name = title()
+          const result = await sdk.session.create({
+            id: args.session,
+            title: name,
+            permission: [...rules],
+          })
+          const id = result.data?.id
+          if (!id) {
+            return
+          }
+
           return {
-            id: current.data.id,
-            title: current.data.title,
-            directory: current.data.directory,
+            id,
+            title: result.data?.title ?? name,
+            directory: result.data?.directory,
           }
         }
 

@@ -1313,6 +1313,23 @@ export type Config = {
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
   }
+  hooks?: Array<{
+    event:
+      | "PreToolUse"
+      | "PostToolUse"
+      | "PostToolUseFailure"
+      | "UserPromptSubmit"
+      | "Stop"
+      | "StopFailure"
+      | "SessionStart"
+      | "SessionEnd"
+      | "PreCompact"
+      | "PostCompact"
+      | "Notification"
+    command: string
+    matcher?: string
+    timeout?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
 }
 
 export type Model = {
@@ -6055,6 +6072,7 @@ export type SessionListResponse = SessionListResponses[keyof SessionListResponse
 
 export type SessionCreateData = {
   body?: {
+    id?: string
     parentID?: string
     title?: string
     agent?: string

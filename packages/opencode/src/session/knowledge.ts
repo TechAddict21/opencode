@@ -41,6 +41,18 @@ function isTrivialQuery(text: string): boolean {
   return false
 }
 
+const FRONTEND_KEYWORDS = [
+  "html", "ui", "frontend", "component", "react", "vue", "css", "design",
+  "interface", "web", "page", "layout", "styled", "tailwind", "component",
+  "widget", "form", "button", "modal", "dashboard", "landing", "clone", 
+  "vite"
+]
+
+function isFrontendQuery(text: string): boolean {
+  const lower = text.toLowerCase()
+  return FRONTEND_KEYWORDS.some(kw => lower.includes(kw))
+}
+
 function formatHistorySnippet(messages: MessageV2.WithParts[]): string {
   const lines: string[] = []
   for (const msg of messages.slice(-40)) {
@@ -135,6 +147,10 @@ export const layer: Layer.Layer<
         return null
       }
 
+      if (isFrontendQuery(userText)) {
+        log.info("feeder frontend query detected", { userMessageID })
+      }
+
       const initialized = yield* KB.ensureInit(workDir).pipe(Effect.provideService(AppFileSystem.Service, fs))
       if (!initialized) {
         log.warn("feeder init failed", { workDir })
@@ -169,21 +185,21 @@ export const layer: Layer.Layer<
 
       log.info("feeder matched", { entries: matchedEntries.length, matchedEntries })
 
-      if (matchedEntries.length === 0) {
-        yield* InstanceState.useEffect(cache, (s) =>
-          Effect.sync(() => {
-            s.lastUserMessageID = userMessageID
-            s.lastUserText = userText
-            s.lastInjection = ""
-          }),
-        )
-        return null
-      }
+      const codeContext =
+        matchedEntries.length > 0
+          ? yield* KB.readRelevantCode(workDir, tree, matchedEntries).pipe(
+              Effect.provideService(AppFileSystem.Service, fs),
+            )
+          : null
 
-      const codeContext = yield* KB.readRelevantCode(workDir, tree, matchedEntries).pipe(
-        Effect.provideService(AppFileSystem.Service, fs),
-      )
-      if (!codeContext) {
+      const frontendHint = isFrontendQuery(userText)
+        ? "\n\n⚠️ CRITICAL INSTRUCTION: This is a frontend/UI/HTML/design request. " +
+          "You MUST call the `skill` tool with parameter name='frontend-design' BEFORE you start coding or designing. " +
+          "This will load the frontend-design skill instructions which are REQUIRED for this task. " +
+          "Do not proceed with any design work, HTML generation, or code output until you have loaded this skill.\n"
+        : ""
+
+      if (!codeContext && !frontendHint) {
         yield* InstanceState.useEffect(cache, (s) =>
           Effect.sync(() => {
             s.lastUserMessageID = userMessageID
@@ -195,13 +211,16 @@ export const layer: Layer.Layer<
       }
 
       const injection =
-        "IMPORTANT: The following files have already been read and their " +
-        "content is provided below. Do NOT read/re-read these files. " +
-        "Use this context directly as the source of truth.\n" +
-        `Knowledge entries matched: ${matchedEntries.join(", ")}\n\n` +
-        codeContext
+        (codeContext
+          ? "IMPORTANT: The following files have already been read and their " +
+            "content is provided below. Do NOT read/re-read these files. " +
+            "Use this context directly as the source of truth.\n" +
+            `Knowledge entries matched: ${matchedEntries.join(", ")}\n\n` +
+            codeContext
+          : "") +
+        frontendHint
 
-      log.info("feeder inject", { bytes: injection.length, entries: matchedEntries })
+      log.info("feeder inject", { bytes: injection.length, entries: matchedEntries, hasFrontendHint: !!frontendHint })
 
       yield* InstanceState.useEffect(cache, (s) =>
         Effect.sync(() => {

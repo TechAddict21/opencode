@@ -384,10 +384,14 @@ renderer.setTerminalTitle("Nous")
         local.model.set({ providerID, modelID }, { recent: true })
       }
       if (args.sessionID && !args.fork) {
-        route.navigate({
-          type: "session",
-          sessionID: args.sessionID,
-        })
+        // Check if the session exists; if not, fall through to create a new one
+        const sessionExists = sync.data.session.some((s) => s.id === args.sessionID)
+        if (sessionExists) {
+          route.navigate({
+            type: "session",
+            sessionID: args.sessionID,
+          })
+        }
       }
     })
   })
@@ -433,7 +437,9 @@ renderer.setTerminalTitle("Nous")
 
   createEffect(() => {
     if (!ready() || route.data.type !== "home") return
-    if (args.continue || args.sessionID) return
+    if (args.continue) return
+    // If --session was passed but the session doesn't exist, create a new one
+    if (args.sessionID && sync.data.session.some((s) => s.id === args.sessionID)) return
     if (!sync.ready || !local.model.ready) return
 
     const agent = local.agent.current()

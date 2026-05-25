@@ -1526,9 +1526,12 @@ export const layer = Layer.effect(
             msg.parts.some((p) => p.type === "tool" && !p.metadata?.providerExecuted)
           )
         if (turnHadToolCalls) {
-          // Run knowledge completer in background to analyze the turn and update
+          // Run knowledge completer to analyze the turn and update
           // the knowledge base (DRILL_DOWN_TREE.md and knowledge files).
-          yield* knowledge.completer(sessionID, msgsForCompleter).pipe(Effect.ignore, Effect.forkIn(scope))
+          // Runs synchronously (not forked) so it completes before the response
+          // is returned — critical for non-interactive mode where the CLI exits
+          // immediately and would interrupt a background fiber.
+          yield* knowledge.completer(sessionID, msgsForCompleter).pipe(Effect.ignore)
         }
         const assistantText = assistantMsg.parts
           .filter((p): p is MessageV2.TextPart => p.type === "text")

@@ -75,4 +75,3 @@ export const Script = {
     return team
   },
 }
-console.log(`opencode script`, JSON.stringify(Script, null, 2))
