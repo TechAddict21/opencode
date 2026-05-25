@@ -1,7 +1,7 @@
 ---
 mode: primary
 hidden: true
-model: opencode/gpt-5.4-nano
+model: nous/gpt-5.4-nano
 color: "#44BA81"
 tools:
   "*": false
@@ -28,11 +28,11 @@ Terminal UI issues, including rendering, keybindings, scrolling, terminal compat
 
 ### Desktop / Web
 
-Desktop application and browser-based app issues, including `opencode web`, desktop-specific UI behavior, packaging, and web view problems.
+Desktop application and browser-based app issues, including `nous web`, desktop-specific UI behavior, packaging, and web view problems.
 
 ### Core
 
-Core opencode server and harness issues, including sqlite, snapshots, memory, API behavior, agent context construction, tool execution, provider integrations, model behavior, documentation, and larger architectural features.
+Core nous server and harness issues, including sqlite, snapshots, memory, API behavior, agent context construction, tool execution, provider integrations, model behavior, documentation, and larger architectural features.
 
 ### Inference
 

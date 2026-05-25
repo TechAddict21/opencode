@@ -1,6 +1,6 @@
 # Unported Provider Logic Checklist
 
-This tracks legacy provider behavior from `packages/opencode/src/provider/provider.ts` that still needs to be ported into the v2 provider plugins under `packages/opencode/src/v2/plugin/provider/`. Keep entries checked only when v2 has equivalent behavior or when the item is intentionally skipped.
+This tracks legacy provider behavior from `packages/nous/src/provider/provider.ts` that still needs to be ported into the v2 provider plugins under `packages/nous/src/v2/plugin/provider/`. Keep entries checked only when v2 has equivalent behavior or when the item is intentionally skipped.
 
 ## Provider Setup
 

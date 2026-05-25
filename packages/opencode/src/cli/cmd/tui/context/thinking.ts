@@ -7,7 +7,7 @@ const MODES: readonly ThinkingMode[] = ["show", "hide"] as const
 
 // OpenAI's Responses API surfaces reasoning summaries that start with a bolded
 // title line: "**Inspecting PR workflow**\n\n<body>". GitHub Copilot routes
-// through the same shape, and the opencode provider relays it too. Pull the
+// through the same shape, and the nous provider relays it too. Pull the
 // title out for a nicer label; return null for providers that don't follow
 // this convention so the caller can fall back to a generic "Thinking" string.
 export function reasoningTitle(text: string): string | null {

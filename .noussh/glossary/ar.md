@@ -2,11 +2,11 @@
 
 ## Sources
 
-- PR #9947: https://github.com/anomalyco/opencode/pull/9947
+- PR #9947: https://github.com/anomalyco/nous/pull/9947
 
 ## Do Not Translate (Locale Additions)
 
-- `OpenCode` (preserve casing in prose; keep `opencode` only in commands, package names, paths, or code)
+- `OpenCode` (preserve casing in prose; keep `nous` only in commands, package names, paths, or code)
 - `OpenCode CLI`
 - `CLI`, `TUI`, `MCP`, `OAuth`
 - Commands, flags, file paths, and code literals (keep exactly as written)

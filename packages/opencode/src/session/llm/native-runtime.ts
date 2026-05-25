@@ -118,7 +118,7 @@ export function nativeTools(tools: Record<string, Tool>, input: Pick<StreamInput
   return Object.fromEntries(
     Object.entries(tools).map(([name, item]) => [
       name,
-      // Tool execution remains opencode-owned. The native runtime only adapts
+      // Tool execution remains nous-owned. The native runtime only adapts
       // the @nous-ai/llm tool call back into the AI SDK Tool.execute shape.
       nativeTool({
         description: item.description ?? "",

@@ -133,9 +133,9 @@ async function showRemovalSummary(targets: RemovalTargets, method: Installation.
       pnpm: "pnpm uninstall -g opencode-ai",
       bun: "bun remove -g opencode-ai",
       yarn: "yarn global remove opencode-ai",
-      brew: "brew uninstall opencode",
-      choco: "choco uninstall opencode",
-      scoop: "scoop uninstall opencode",
+      brew: "brew uninstall nous",
+      choco: "choco uninstall nous",
+      scoop: "scoop uninstall nous",
     }
     prompts.log.info(`  ✓ Package: ${cmds[method] || method}`)
   }
@@ -215,7 +215,7 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
     prompts.log.info(`  rm "${targets.binary}"`)
 
     const binDir = path.dirname(targets.binary)
-    if (binDir.includes(".noussh")) {
+    if (binDir.includes(".opencode")) {
       prompts.log.info(`  rmdir "${binDir}" 2>/dev/null`)
     }
   }
@@ -266,7 +266,7 @@ async function getShellConfigFile(): Promise<string | null> {
     if (!exists) continue
 
     const content = await Filesystem.readText(file).catch(() => "")
-    if (content.includes("# nous") || content.includes(".noussh/bin")) {
+    if (content.includes("# opencode") || content.includes(".opencode/bin")) {
       return file
     }
   }
@@ -284,21 +284,21 @@ async function cleanShellConfig(file: string) {
   for (const line of lines) {
     const trimmed = line.trim()
 
-    if (trimmed === "# nous") {
+    if (trimmed === "# opencode") {
       skip = true
       continue
     }
 
     if (skip) {
       skip = false
-      if (trimmed.includes(".noussh/bin") || trimmed.includes("fish_add_path")) {
+      if (trimmed.includes(".opencode/bin") || trimmed.includes("fish_add_path")) {
         continue
       }
     }
 
     if (
-      (trimmed.startsWith("export PATH=") && trimmed.includes(".noussh/bin")) ||
-      (trimmed.startsWith("fish_add_path") && trimmed.includes(".noussh"))
+      (trimmed.startsWith("export PATH=") && trimmed.includes(".opencode/bin")) ||
+      (trimmed.startsWith("fish_add_path") && trimmed.includes(".opencode"))
     ) {
       continue
     }

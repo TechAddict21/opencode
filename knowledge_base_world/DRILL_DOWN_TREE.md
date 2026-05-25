@@ -9,33 +9,37 @@ Template:
     → Read: <path/to/code/files>
 
 ## Project Overview
-- **Overview.md** — High-level repo structure, package purposes, branding (nous/OpenCode)
-  → Read: package.json, packages/*/package.json
+- **Overview.md** — High-level repo structure, monorepo layout, and package purposes
+  → Read: package.json, README.md
 
-## CLI/TUI
-- **CLI.md** — Terminal interface application in `packages/opencode`
-  → Read: packages/opencode/src/
+## Packages
+- **OpenCode.md** — Core CLI/agent package (`packages/opencode`)
+  → Read: packages/opencode/package.json, packages/opencode/src/
+- **App.md** — Web application (`packages/app`)
+  → Read: packages/app/package.json, packages/app/src/
+- **Desktop.md** — Desktop application (`packages/desktop`)
+  → Read: packages/desktop/package.json, packages/desktop/src/
+- **Core.md** — Shared core logic (`packages/core`)
+  → Read: packages/core/package.json, packages/core/src/
+- **SDK.md** — SDK package (`packages/sdk`)
+  → Read: packages/sdk/package.json, packages/sdk/src/
+- **Plugin.md** — Plugin system (`packages/plugin`)
+  → Read: packages/plugin/package.json, packages/plugin/src/
+- **Script.md** — Scripting support (`packages/script`)
+  → Read: packages/script/package.json, packages/script/src/
+- **UI.md** — UI components (`packages/ui`)
+  → Read: packages/ui/package.json, packages/ui/src/
+- **Storybook.md** — Storybook configuration (`packages/storybook`)
+  → Read: packages/storybook/package.json
+- **LLM.md** — LLM integrations (`packages/llm`)
+  → Read: packages/llm/package.json, packages/llm/src/
+- **Console.md** — Console package (`packages/console`)
+  → Read: packages/console/package.json, packages/console/src/
+- **Identity.md** — Identity package (`packages/identity`)
+  → Read: packages/identity/package.json, packages/identity/src/
+- **Containers.md** — Containers package (`packages/containers`)
+  → Read: packages/containers/package.json, packages/containers/src/
 
-## Web App
-- **WebApp.md** — Browser-based UI in `packages/app` (SolidJS + Vite)
-  → Read: packages/app/src/
-
-## Desktop App
-- **Desktop.md** — Electron wrapper in `packages/desktop`
-  → Read: packages/desktop/src/
-
-## Core
-- **Core.md** — Shared business logic across all platforms in `packages/core`
-  → Read: packages/core/src/
-
-## LLM Providers
-- **LLM.md** — Provider integrations (OpenAI, Anthropic, Google, Groq, etc.) in `packages/llm`
-  → Read: packages/llm/src/
-
-## Plugins
-- **Plugins.md** — Plugin system architecture in `packages/plugin`
-  → Read: packages/plugin/src/
-
-## SDK
-- **SDK.md** — External developer SDK in `packages/sdk`
-  → Read: packages/sdk/src/
+## Technology Stack
+- **TechStack.md** — Primary technologies used across the monorepo
+  → Read: package.json (root), bun.lockb

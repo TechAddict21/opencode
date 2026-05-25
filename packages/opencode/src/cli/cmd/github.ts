@@ -549,7 +549,7 @@ export const GithubRunCommand = effectCmd({
           await addReaction(commentType)
         }
 
-        // Setup opencode session
+        // Setup nous session
         const repoData = await fetchRepo()
         session = await runLocalEffect(
           sessionSvc.create({
@@ -569,7 +569,7 @@ export const GithubRunCommand = effectCmd({
           await runLocalEffect(sessionShare.share(session.id))
           return session.id.slice(-8)
         })()
-        console.log("opencode session", session.id)
+        console.log("nous session", session.id)
 
         // Handle event types:
         // REPO_EVENTS (schedule, workflow_dispatch): no issue/PR context, output to logs/PR only
@@ -939,7 +939,7 @@ export const GithubRunCommand = effectCmd({
       }
 
       async function chat(message: string, files: PromptFiles = []) {
-        console.log("Sending message to opencode...")
+        console.log("Sending message to nous...")
 
         return runLocalEffect(
           Effect.gen(function* () {

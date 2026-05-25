@@ -506,7 +506,7 @@ export class Agent implements ACPAgent {
     log.info("initialize", { protocolVersion: params.protocolVersion })
 
     const authMethod: AuthMethod = {
-      description: "Run `opencode auth login` in the terminal",
+      description: "Run `nous auth login` in the terminal",
       name: "Login with opencode",
       id: "opencode-login",
     }
