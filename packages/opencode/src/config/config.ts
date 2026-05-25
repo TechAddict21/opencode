@@ -41,6 +41,7 @@ import { ConfigReference } from "./reference"
 import { ConfigServer } from "./server"
 import { ConfigSkills } from "./skills"
 import { ConfigVariable } from "./variable"
+import { ConfigHook } from "./hook"
 import { Npm } from "@nous-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 
@@ -303,6 +304,9 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  hooks: Schema.optional(ConfigHook.Hooks).annotate({
+    description: "Hook definitions for CLI lifecycle events",
+  }),
 }).annotate({ identifier: "Config" })
 
 // Uses the shared `DeepMutable` from `@nous-ai/core/schema`. See the definition

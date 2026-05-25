@@ -28,6 +28,7 @@ import { Permission } from "@/permission"
 import { Installation } from "@/installation"
 import { InstanceLayer } from "@/project/instance-layer"
 import { Plugin } from "@/plugin"
+import { Hook } from "@/hook"
 import { Project } from "@/project/project"
 import { ProviderAuth } from "@/provider/auth"
 import { ModelsDev } from "@nous-ai/core/models-dev"
@@ -205,6 +206,7 @@ export function createRoutes(
       ModelsDev.defaultLayer,
       Permission.defaultLayer,
       Plugin.defaultLayer,
+      Hook.defaultLayer,
       Project.defaultLayer,
       ProviderAuth.defaultLayer,
       Provider.defaultLayer,

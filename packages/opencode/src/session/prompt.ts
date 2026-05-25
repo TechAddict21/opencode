@@ -14,7 +14,10 @@ import { SessionCompaction } from "./compaction"
 import { Bus } from "../bus"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
+import { Knowledge } from "./knowledge"
 import { Plugin } from "../plugin"
+import { Hook } from "@/hook"
+import * as HookWebhook from "@/hook/webhook"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
@@ -37,6 +40,7 @@ import { LLM } from "./llm"
 import { Shell } from "@/shell/shell"
 import { ShellID } from "@/tool/shell/id"
 import { AppFileSystem } from "@nous-ai/core/filesystem"
+import { Global } from "@nous-ai/core/global"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
@@ -103,6 +107,7 @@ export const layer = Layer.effect(
     const processor = yield* SessionProcessor.Service
     const compaction = yield* SessionCompaction.Service
     const plugin = yield* Plugin.Service
+    const hook = yield* Hook.Service
     const commands = yield* Command.Service
     const config = yield* Config.Service
     const permission = yield* Permission.Service
@@ -115,6 +120,7 @@ export const layer = Layer.effect(
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
+    const knowledge = yield* Knowledge.Service
     const state = yield* SessionRunState.Service
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
@@ -1224,6 +1230,18 @@ export const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
+      const promptText = input.parts
+        .filter((p) => p.type === "text")
+        .map((p) => p.text)
+        .join("\n")
+      const hookInput = {
+        session_id: input.sessionID,
+        cwd: process.cwd(),
+        prompt: promptText,
+      }
+      yield* hook.trigger("UserPromptSubmit", hookInput)
+      HookWebhook.fire("UserPromptSubmit", hookInput)
+
       if (input.noReply === true) return message
       return yield* loop({ sessionID: input.sessionID })
     })
@@ -1236,8 +1254,7 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop = Effect.fnUntraced(function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown
@@ -1299,6 +1316,7 @@ export const layer = Layer.effect(
               auto: task.auto,
               overflow: task.overflow,
             })
+            yield* knowledge.resetCache().pipe(Effect.ignore)
             if (result === "stop") break
             continue
           }
@@ -1309,6 +1327,7 @@ export const layer = Layer.effect(
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            yield* knowledge.resetCache().pipe(Effect.ignore)
             continue
           }
 
@@ -1364,8 +1383,8 @@ export const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+            const lastUserMsgForTools = msgs.findLast((m) => m.info.role === "user")
+            const bypassAgentCheck = lastUserMsgForTools?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
             const tools = yield* SessionTools.resolve({
@@ -1416,6 +1435,20 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            // Knowledge feeder: inject relevant codebase context before every LLM call.
+            // The feeder deduplicates by userMessageID so it only reads files once per turn.
+            let knowledgeContext: string | null = null
+            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const userText = lastUserMsg?.parts
+              .filter((p): p is MessageV2.TextPart => p.type === "text")
+              .map((p) => p.text)
+              .join("\n") ?? ""
+            if (userText.trim() && lastUserMsg) {
+              knowledgeContext = yield* knowledge
+                .feeder(userText, lastUserMsg.info.id)
+                .pipe(Effect.catch(() => Effect.succeed(null)))
+            }
+
             const [skills, env, instructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
@@ -1423,6 +1456,7 @@ export const layer = Layer.effect(
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+            if (knowledgeContext) system.push(knowledgeContext)
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const result = yield* handle.process({
@@ -1477,14 +1511,53 @@ export const layer = Layer.effect(
         }
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
+
+        const assistantMsg = yield* lastAssistant(sessionID)
+        const assistantInfo = assistantMsg.info as MessageV2.Assistant
+
+        // Trigger knowledge completer in background after turns with tool calls.
+        // The loop exits when finish != "tool-calls", so we must scan the turn's
+        // messages to see if any assistant response contained tool calls.
+        const msgsForCompleter = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+        const lastUserMsgIndex = msgsForCompleter.findLastIndex((m) => m.info.role === "user")
+        const turnHadToolCalls =
+          lastUserMsgIndex >= 0 &&
+          msgsForCompleter.slice(lastUserMsgIndex + 1).some((msg) =>
+            msg.parts.some((p) => p.type === "tool" && !p.metadata?.providerExecuted)
+          )
+        if (turnHadToolCalls) {
+          // Run knowledge completer in background to analyze the turn and update
+          // the knowledge base (DRILL_DOWN_TREE.md and knowledge files).
+          yield* knowledge.completer(sessionID, msgsForCompleter).pipe(Effect.ignore, Effect.forkIn(scope))
+        }
+        const assistantText = assistantMsg.parts
+          .filter((p): p is MessageV2.TextPart => p.type === "text")
+          .map((p) => p.text)
+          .join("\n")
+        const hookInput = {
+          session_id: sessionID,
+          cwd: process.cwd(),
+          stop_hook_active: false,
+          assistantText,
+          model: `${assistantInfo.providerID}/${assistantInfo.modelID}`,
+        }
+        yield* hook.trigger("Stop", hookInput)
+        HookWebhook.fire("Stop", hookInput)
+        return assistantMsg
       },
     )
 
     const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID).pipe(
+          Effect.provideService(Hook.Service, hook),
+          Effect.provideService(Knowledge.Service, knowledge),
+        ),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts, Session.BusyError> = Effect.fn(
@@ -1634,11 +1707,15 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(LSP.defaultLayer),
     Layer.provide(ToolRegistry.defaultLayer),
     Layer.provide(Truncate.defaultLayer),
+  ).pipe(
     Layer.provide(Provider.defaultLayer),
     Layer.provide(Config.defaultLayer),
+    Layer.provide(Knowledge.defaultLayer),
     Layer.provide(Instruction.defaultLayer),
+    Layer.provide(Global.layer),
     Layer.provide(AppFileSystem.defaultLayer),
     Layer.provide(Plugin.defaultLayer),
+    Layer.provide(Hook.defaultLayer),
     Layer.provide(Session.defaultLayer),
     Layer.provide(SessionRevert.defaultLayer),
     Layer.provide(SessionSummary.defaultLayer),

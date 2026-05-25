@@ -1,4 +1,5 @@
 import { Plugin } from "../plugin"
+import { Hook } from "@/hook"
 import { Format } from "../format"
 import { LSP } from "@/lsp/lsp"
 import { File } from "../file"
@@ -64,6 +65,7 @@ export const defaultLayer: Layer.Layer<Service> = layer.pipe(
     Format.defaultLayer,
     LSP.defaultLayer,
     Plugin.defaultLayer,
+    Hook.defaultLayer,
     Project.defaultLayer,
     Reference.defaultLayer,
     ShareNext.defaultLayer,

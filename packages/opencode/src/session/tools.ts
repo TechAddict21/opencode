@@ -9,6 +9,8 @@ import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { ModelID } from "@/provider/schema"
 import { Plugin } from "@/plugin"
+import { Hook } from "@/hook"
+import * as HookWebhook from "@/hook/webhook"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { Effect } from "effect"
@@ -34,6 +36,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
+  const hook = yield* Hook.Service
   const permission = yield* Permission.Service
   const registry = yield* ToolRegistry.Service
   const mcp = yield* MCP.Service
@@ -85,12 +88,43 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
+            const hookInput = {
+              session_id: ctx.sessionID,
+              cwd: process.cwd(),
+              tool_name: item.id,
+              tool_input: args,
+              tool_call_id: ctx.callID,
+            }
+            yield* hook.trigger("PreToolUse", hookInput)
+            HookWebhook.fire("PreToolUse", hookInput)
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
               { args },
             )
-            const result = yield* item.execute(args, ctx)
+
+            const result = yield* item.execute(args, ctx).pipe(
+              Effect.matchEffect({
+                onFailure: (error) => {
+                  const errorMessage = String(error)
+                  const failurePayload = {
+                    session_id: ctx.sessionID,
+                    cwd: process.cwd(),
+                    tool_name: item.id,
+                    tool_input: args,
+                    error: errorMessage,
+                    tool_call_id: ctx.callID,
+                  }
+                  return Effect.gen(function* () {
+                    yield* hook.trigger("PostToolUseFailure", failurePayload)
+                    HookWebhook.fire("PostToolUseFailure", failurePayload)
+                    return yield* Effect.fail(error)
+                  })
+                },
+                onSuccess: (result) => Effect.succeed(result),
+              }),
+            )
+
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({
@@ -100,6 +134,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 messageID: input.processor.message.id,
               })),
             }
+            const hookOutput = {
+              session_id: ctx.sessionID,
+              cwd: process.cwd(),
+              tool_name: item.id,
+              tool_input: args,
+              tool_output: typeof output.output === "string" ? output.output : JSON.stringify(output.output),
+              tool_call_id: ctx.callID,
+            }
+            yield* hook.trigger("PostToolUse", hookOutput)
+            HookWebhook.fire("PostToolUse", hookOutput)
             yield* plugin.trigger(
               "tool.execute.after",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
@@ -126,6 +170,15 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
+          const hookInput = {
+            session_id: ctx.sessionID,
+            cwd: process.cwd(),
+            tool_name: key,
+            tool_input: args,
+            tool_call_id: ctx.callID,
+          }
+          yield* hook.trigger("PreToolUse", hookInput)
+          HookWebhook.fire("PreToolUse", hookInput)
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -143,7 +196,40 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 "message.id": input.processor.message.id,
               },
             }),
+            Effect.matchEffect({
+              onFailure: (error) => {
+                const errorMessage = String(error)
+                const failurePayload = {
+                  session_id: ctx.sessionID,
+                  cwd: process.cwd(),
+                  tool_name: key,
+                  tool_input: args,
+                  error: errorMessage,
+                  tool_call_id: ctx.callID,
+                }
+                return Effect.gen(function* () {
+                  yield* hook.trigger("PostToolUseFailure", failurePayload)
+                  HookWebhook.fire("PostToolUseFailure", failurePayload)
+                  return yield* Effect.fail(error)
+                })
+              },
+              onSuccess: (result) => Effect.succeed(result),
+            }),
           )
+          const outputText = result.content
+            .filter((c: { type: string; text?: string }) => c.type === "text")
+            .map((c: { type: string; text?: string }) => c.text ?? "")
+            .join("\n")
+          const hookOutput = {
+            session_id: ctx.sessionID,
+            cwd: process.cwd(),
+            tool_name: key,
+            tool_input: args,
+            tool_output: outputText,
+            tool_call_id: ctx.callID,
+          }
+          yield* hook.trigger("PostToolUse", hookOutput)
+          HookWebhook.fire("PostToolUse", hookOutput)
           yield* plugin.trigger(
             "tool.execute.after",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },

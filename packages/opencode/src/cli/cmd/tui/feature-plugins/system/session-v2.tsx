@@ -306,10 +306,6 @@ function AssistantMessage(props: {
     if (!props.message.time.completed) return 0
     return props.message.time.completed - (props.start ?? props.message.time.created)
   })
-  const model = createMemo(() => {
-    const variant = props.message.model.variant ? `/${props.message.model.variant}` : ""
-    return `${props.message.model.providerID}/${props.message.model.id}${variant}`
-  })
   const final = createMemo(() => props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish))
   return (
     <>
@@ -355,7 +351,6 @@ function AssistantMessage(props: {
           <text marginTop={1}>
             <span style={{ fg: local.agent.color(props.message.agent) }}>▣ </span>
             <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.agent)}</span>
-            <span style={{ fg: theme.textMuted }}> · {model()}</span>
             <Show when={duration()}>
               <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
             </Show>
@@ -734,11 +729,6 @@ function Bash(props: ToolProps) {
           </box>
         </BlockTool>
       </Match>
-      <Match when={true}>
-        <InlineTool icon="$" pending="Writing command..." complete={command()} part={props.part}>
-          {command()}
-        </InlineTool>
-      </Match>
     </Switch>
   )
 }
@@ -843,11 +833,6 @@ function Write(props: ToolProps) {
           <Diagnostics diagnostics={props.metadata.diagnostics} filePath={filePath()} />
         </BlockTool>
       </Match>
-      <Match when={true}>
-        <InlineTool icon="←" pending="Preparing write..." complete={filePath()} part={props.part}>
-          Write {normalizePath(filePath())}
-        </InlineTool>
-      </Match>
     </Switch>
   )
 }
@@ -886,11 +871,6 @@ function Edit(props: ToolProps) {
             <Diagnostics diagnostics={props.metadata.diagnostics} filePath={filePath()} />
           </BlockTool>
         )}
-      </Match>
-      <Match when={true}>
-        <InlineTool icon="←" pending="Preparing edit..." complete={filePath()} part={props.part}>
-          Edit {normalizePath(filePath())} {input({ replaceAll: props.input.replaceAll })}
-        </InlineTool>
       </Match>
     </Switch>
   )
@@ -976,11 +956,6 @@ function TodoWrite(props: ToolProps) {
             </For>
           </box>
         </BlockTool>
-      </Match>
-      <Match when={true}>
-        <InlineTool icon="⚙" pending="Updating todos..." complete={false} part={props.part}>
-          Updating todos...
-        </InlineTool>
       </Match>
     </Switch>
   )

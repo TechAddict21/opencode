@@ -109,6 +109,9 @@ const cli = yargs(args)
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
 
+    const { initialize: initWebhook } = await import("./hook/webhook")
+    initWebhook(process.env.WEBHOOK_URL_ENDPOINT, process.env.WEBHOOK_SESSION_ID)
+
     Log.Default.info("opencode", {
       version: InstallationVersion,
       args: process.argv.slice(2),
