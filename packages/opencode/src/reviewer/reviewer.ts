@@ -230,7 +230,7 @@ export const layer = Layer.effect(
 export const defaultLayer = layer.pipe(
   Layer.provide(Config.defaultLayer),
   Layer.provide(Provider.defaultLayer),
-  Layer.provide(LLM.layer),
+  Layer.provide(LLM.defaultLayer),
 )
 
 export * as Reviewer from "./reviewer"
