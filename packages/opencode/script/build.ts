@@ -45,7 +45,6 @@ const migrations = await Promise.all(
     return { sql, timestamp, name }
   }),
 )
-console.log(`Loaded ${migrations.length} migrations`)
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")

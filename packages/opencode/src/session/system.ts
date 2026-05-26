@@ -49,7 +49,7 @@ export const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         return [
           [
-            `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+            `You are powered by the model named Claude Opus 4.7. The exact model ID is anthropic/claude-opus-4.7`,
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
             `  Working directory: ${ctx.directory}`,

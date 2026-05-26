@@ -120,6 +120,7 @@ export const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      const reviewerEnabled = (yield* config.get()).reviewer?.enabled ?? true
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 
       const parse = (e: unknown) =>
@@ -320,6 +321,7 @@ export const layer = Layer.effect(
               sessionID: ctx.assistantMessage.sessionID,
               type: "reasoning",
               text: "",
+              ignored: reviewerEnabled ? true : undefined,
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
@@ -632,6 +634,7 @@ export const layer = Layer.effect(
               sessionID: ctx.assistantMessage.sessionID,
               type: "text",
               text: "",
+              ignored: reviewerEnabled ? true : undefined,
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
@@ -707,6 +710,7 @@ export const layer = Layer.effect(
         if (ctx.currentText) {
           const end = Date.now()
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
+          if (reviewerEnabled) ctx.currentText.ignored = false
           yield* session.updatePart(ctx.currentText)
           ctx.currentText = undefined
         }
@@ -715,6 +719,7 @@ export const layer = Layer.effect(
           const end = Date.now()
           yield* session.updatePart({
             ...part,
+            ignored: reviewerEnabled ? false : undefined,
             time: { start: part.time.start ?? end, end },
           })
         }

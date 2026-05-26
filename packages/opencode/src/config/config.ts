@@ -286,6 +286,16 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  reviewer: Schema.optional(
+    Schema.Struct({
+      enabled: Schema.optional(Schema.Boolean).annotate({
+        description: "Enable reviewer flow before final response (default: true)",
+      }),
+      max_iterations: Schema.optional(NonNegativeInt).annotate({
+        description: "Maximum reviewer iterations per turn (default: 3)",
+      }),
+    }),
+  ).annotate({ description: "Reviewer configuration for peer-reviewing assistant responses" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),

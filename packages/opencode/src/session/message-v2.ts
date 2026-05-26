@@ -114,6 +114,7 @@ export const ReasoningPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("reasoning"),
   text: Schema.String,
+  ignored: Schema.optional(Schema.Boolean),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
   time: Schema.Struct({
     start: NonNegativeInt,

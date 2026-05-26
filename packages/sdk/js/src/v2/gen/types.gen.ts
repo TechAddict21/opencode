@@ -509,6 +509,7 @@ export type ReasoningPart = {
   messageID: string
   type: "reasoning"
   text: string
+  ignored?: boolean
   metadata?: {
     [key: string]: unknown
   }

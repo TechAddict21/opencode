@@ -65,6 +65,7 @@ import { referencePromptMetadata, referenceTextPart } from "./prompt/reference"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@nous-ai/llm"
+import { Reviewer } from "@/reviewer/reviewer"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -129,6 +130,7 @@ export const layer = Layer.effect(
     const references = yield* Reference.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const reviewer = yield* Reviewer.Service
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -1259,6 +1261,7 @@ export const layer = Layer.effect(
         const slog = elog.with({ sessionID })
         let structured: unknown
         let step = 0
+        let reviewerIterations = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1274,8 +1277,6 @@ export const layer = Layer.effect(
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
-          // Some providers return "stop" even when the assistant message contains tool calls.
-          // Keep the loop running so tool results can be sent back to the model.
           // Skip provider-executed tool parts — those were fully handled within the
           // provider's stream (e.g. DWS Agent Platform) and don't need a re-loop.
           const hasToolCalls =
@@ -1287,6 +1288,180 @@ export const layer = Layer.effect(
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
+            // Reviewer: check final response before presenting to user
+            const cfg = yield* config.get()
+            const reviewerConfig = cfg.reviewer
+            const reviewerEnabled = reviewerConfig?.enabled ?? true
+            const reviewerMaxIterations = reviewerConfig?.max_iterations ?? 3
+
+            yield* slog.info("reviewer.check", {
+              enabled: reviewerEnabled,
+              iterations: reviewerIterations,
+              max: reviewerMaxIterations,
+              hasAssistantMsg: Boolean(lastAssistantMsg),
+            })
+
+            if (
+              reviewerEnabled &&
+              lastAssistantMsg &&
+              reviewerIterations < reviewerMaxIterations
+            ) {
+              // Fetch fresh assistant message to ensure we have all streamed parts
+              const freshAssistant = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(
+                Effect.orDie,
+                Effect.map((opt) => {
+                  if (Option.isSome(opt)) return opt.value
+                  throw new Error("No assistant message found")
+                }),
+              )
+              const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+
+              yield* slog.info("reviewer.running", {
+                sessionID,
+                messageID: freshAssistant.info.id,
+                model: `${model.providerID}/${model.id}`,
+                iteration: reviewerIterations + 1,
+                max: reviewerMaxIterations,
+              })
+
+              const reviewResult = yield* reviewer.review({
+                sessionID,
+                history: msgs,
+                finalMessage: freshAssistant,
+                model,
+                user: lastUser,
+              })
+
+              reviewerIterations++
+
+              if (reviewResult) {
+                yield* slog.info("reviewer.result", {
+                  need_changes: reviewResult.need_changes,
+                  has_feedback: Boolean(reviewResult.feedback),
+                  has_refined: Boolean(reviewResult.refined_response),
+                  iteration: reviewerIterations,
+                })
+
+                // Prioritize refined_response over need_changes to avoid regeneration loops
+                if (reviewResult.refined_response) {
+                  yield* slog.info("reviewer.applying-refined", {
+                    length: reviewResult.refined_response.length,
+                    iteration: reviewerIterations,
+                  })
+
+                  const textParts = freshAssistant.parts.filter(
+                    (p: MessageV2.Part): p is MessageV2.TextPart => p.type === "text" && !p.synthetic,
+                  )
+
+                  if (textParts.length > 0) {
+                    // Update first text part with refined response and make visible
+                    yield* slog.info("reviewer.updating-text", {
+                      partID: textParts[0].id,
+                      oldText: textParts[0].text.slice(0, 100),
+                      newText: reviewResult.refined_response.slice(0, 100),
+                    })
+                    yield* sessions.updatePart({
+                      ...textParts[0],
+                      text: reviewResult.refined_response,
+                      ignored: false,
+                    })
+                    // Remove any additional text parts
+                    for (let i = 1; i < textParts.length; i++) {
+                      yield* sessions.removePart({
+                        sessionID,
+                        messageID: freshAssistant.info.id,
+                        partID: textParts[i].id,
+                      })
+                    }
+                  } else {
+                    yield* slog.warn("reviewer.no-text-parts-to-update")
+                  }
+
+                  // Also update reasoning parts if refined_reasoning is provided
+                  if (reviewResult.refined_reasoning) {
+                    const reasoningParts = freshAssistant.parts.filter(
+                      (p: MessageV2.Part): p is MessageV2.ReasoningPart => p.type === "reasoning",
+                    )
+                    if (reasoningParts.length > 0) {
+                      yield* slog.info("reviewer.updating-reasoning", {
+                        partID: reasoningParts[0].id,
+                        oldText: reasoningParts[0].text.slice(0, 100),
+                        newText: reviewResult.refined_reasoning.slice(0, 100),
+                      })
+                      yield* sessions.updatePart({
+                        ...reasoningParts[0],
+                        text: reviewResult.refined_reasoning,
+                        ignored: false,
+                      })
+                      // Remove additional reasoning parts
+                      for (let i = 1; i < reasoningParts.length; i++) {
+                        yield* sessions.removePart({
+                          sessionID,
+                          messageID: freshAssistant.info.id,
+                          partID: reasoningParts[i].id,
+                        })
+                      }
+                    }
+                  }
+
+                } else if (reviewResult.need_changes) {
+                  yield* slog.info("reviewer.requesting-changes", {
+                    feedback: reviewResult.feedback.slice(0, 200),
+                    iteration: reviewerIterations,
+                    max: reviewerMaxIterations,
+                  })
+                  const feedbackText =
+                    reviewResult.feedback ||
+                    "Please revise your previous response to address any issues."
+
+                  // Inject feedback as a new user message
+                  const feedbackMsg: MessageV2.User = {
+                    id: MessageID.ascending(),
+                    role: "user",
+                    sessionID,
+                    time: { created: Date.now() },
+                    tools: {},
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                  }
+                  const feedbackPart: MessageV2.TextPart = {
+                    id: PartID.ascending(),
+                    messageID: feedbackMsg.id,
+                    sessionID,
+                    type: "text",
+                    text: feedbackText,
+                    synthetic: true,
+                  }
+                  yield* sessions.updateMessage(feedbackMsg)
+                  yield* sessions.updatePart(feedbackPart)
+
+                  continue
+                }
+              } else {
+                yield* slog.info("reviewer.no-result", {
+                  iteration: reviewerIterations,
+                })
+              }
+            } else if (reviewerEnabled && lastAssistantMsg) {
+              yield* slog.info("reviewer.max-iterations-reached", {
+                max: reviewerMaxIterations,
+              })
+            }
+
+            // Un-ignore text/reasoning parts so the final response is visible
+            // Fetch fresh message to avoid overwriting reviewer's corrected text
+            const currentAssistant = yield* sessions.findMessage(sessionID, (m) => m.info.id === lastAssistant.id).pipe(
+              Effect.orDie,
+              Effect.map((opt) => Option.getOrNull(opt)),
+            )
+            if (currentAssistant) {
+              for (const part of currentAssistant.parts) {
+                if ((part.type === "text" || part.type === "reasoning") && part.ignored) {
+                  yield* sessions.updatePart({ ...part, ignored: false })
+                }
+              }
+            }
+
             yield* slog.info("exiting loop")
             break
           }
@@ -1492,6 +1667,22 @@ export const layer = Layer.effect(
             }
 
             if (result === "stop") return "break" as const
+
+            // Un-ignore text/reasoning parts for non-stop finishes (tool-calls, etc.)
+            if (handle.message.finish && handle.message.finish !== "stop") {
+              const assistantMsg = yield* sessions.findMessage(sessionID, (m) => m.info.id === handle.message.id).pipe(
+                Effect.orDie,
+                Effect.map((opt) => Option.getOrNull(opt)),
+              )
+              if (assistantMsg) {
+                for (const part of assistantMsg.parts) {
+                  if ((part.type === "text" || part.type === "reasoning") && part.ignored) {
+                    yield* sessions.updatePart({ ...part, ignored: false })
+                  }
+                }
+              }
+            }
+
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -1730,6 +1921,7 @@ export const defaultLayer = Layer.suspend(() =>
         SystemPrompt.defaultLayer,
         LLM.defaultLayer,
         Reference.defaultLayer,
+        Reviewer.defaultLayer,
         Bus.layer,
         CrossSpawnSpawner.defaultLayer,
         RuntimeFlags.defaultLayer,

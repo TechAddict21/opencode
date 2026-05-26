@@ -1361,13 +1361,13 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
 
   return (
     <>
-      <For each={props.parts}>
+      <For each={props.parts.filter((part) => !(part.type === "text" || part.type === "reasoning") || !part.ignored)}>
         {(part, index) => {
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
           return (
             <Show when={component()}>
               <Dynamic
-                last={index() === props.parts.length - 1}
+                last={index() === props.parts.filter((p) => !(p.type === "text" || p.type === "reasoning") || !p.ignored).length - 1}
                 component={component()}
                 part={part as any}
                 message={props.message}

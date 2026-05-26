@@ -11984,6 +11984,9 @@
           "text": {
             "type": "string"
           },
+          "ignored": {
+            "type": "boolean"
+          },
           "metadata": {
             "type": "object"
           },
