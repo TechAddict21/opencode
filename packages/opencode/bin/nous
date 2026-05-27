@@ -191,14 +191,32 @@ function findBinary(startDir) {
 function findDistBinary() {
   const distDir = path.join(scriptDir, "..", "dist")
   if (!fs.existsSync(distDir)) return
-  
+
   for (const name of names) {
     const candidate = path.join(distDir, name, "bin", "opencode")
     if (fs.existsSync(candidate)) return candidate
   }
 }
 
-const resolved = envPath || (fs.existsSync(cached) ? cached : findDistBinary() || findBinary(scriptDir))
+// Check for binary in the same directory (used by shareable bundles)
+function findLocalBinary() {
+  const candidate = path.join(scriptDir, binary)
+  if (fs.existsSync(candidate)) return candidate
+}
+
+// Bundled mode: when distributed with bundled config, automatically
+// set the appropriate environment variables so the recipient gets the same
+// configuration without any manual setup.
+const bundleDir = path.join(scriptDir, "..")
+const bundleConfigDir = path.join(bundleDir, "config")
+const bundleDataDir = path.join(bundleDir, "data", "nous")
+
+if (fs.existsSync(bundleConfigDir)) {
+  process.env.OPENCODE_CONFIG_DIR = bundleConfigDir
+  process.env.XDG_DATA_HOME = path.join(bundleDir, "data")
+}
+
+const resolved = envPath || (fs.existsSync(cached) ? cached : findLocalBinary() || findDistBinary() || findBinary(scriptDir))
 if (!resolved) {
   console.error(
     "It seems that your package manager failed to install the right version of the nous CLI for your platform. You can try manually installing " +

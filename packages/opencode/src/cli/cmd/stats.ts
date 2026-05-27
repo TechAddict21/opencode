@@ -320,8 +320,16 @@ export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit
   console.log(renderRow("Avg Tokens/Session", formatNumber(Math.round(tokensPerSession))))
   const medianTokensPerSession = isNaN(stats.medianTokensPerSession) ? 0 : stats.medianTokensPerSession
   console.log(renderRow("Median Tokens/Session", formatNumber(Math.round(medianTokensPerSession))))
+  const totalTokens =
+    stats.totalTokens.input +
+    stats.totalTokens.output +
+    stats.totalTokens.reasoning +
+    stats.totalTokens.cache.read +
+    stats.totalTokens.cache.write
+  console.log(renderRow("Total Tokens", formatNumber(totalTokens)))
   console.log(renderRow("Input", formatNumber(stats.totalTokens.input)))
   console.log(renderRow("Output", formatNumber(stats.totalTokens.output)))
+  console.log(renderRow("Reasoning", formatNumber(stats.totalTokens.reasoning)))
   console.log(renderRow("Cache Read", formatNumber(stats.totalTokens.cache.read)))
   console.log(renderRow("Cache Write", formatNumber(stats.totalTokens.cache.write)))
   console.log("└────────────────────────────────────────────────────────┘")

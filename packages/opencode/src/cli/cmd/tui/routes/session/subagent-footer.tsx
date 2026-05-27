@@ -54,6 +54,24 @@ export function SubagentFooter() {
     }
   })
 
+  const cumulativeUsage = createMemo(() => {
+    const s = session()
+    if (!s?.tokens) return
+
+    let tokens =
+      s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cache.read + s.tokens.cache.write
+    if (tokens <= 0) return
+
+    const children = sync.data.session.filter((x) => x.parentID === s.id)
+    for (const child of children) {
+      if (child.tokens)
+        tokens +=
+          child.tokens.input + child.tokens.output + child.tokens.reasoning + child.tokens.cache.read + child.tokens.cache.write
+    }
+
+    return `${Locale.number(tokens)} total`
+  })
+
   const { theme } = useTheme()
   const keymap = useOpencodeKeymap()
   const parentShortcut = useCommandShortcut("session.parent")
@@ -88,7 +106,7 @@ export function SubagentFooter() {
             <Show when={usage()}>
               {(item) => (
                 <text fg={theme.textMuted} wrapMode="none">
-                  {[item().context, item().cost].filter(Boolean).join(" · ")}
+                  {[item().context, item().cost, cumulativeUsage()].filter(Boolean).join(" · ")}
                 </text>
               )}
             </Show>

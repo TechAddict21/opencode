@@ -349,6 +349,25 @@ export function Prompt(props: PromptProps) {
     }
   })
 
+  const cumulativeUsage = createMemo(() => {
+    if (!props.sessionID) return
+    const session = sync.session.get(props.sessionID)
+    if (!session?.tokens) return
+
+    let tokens =
+      session.tokens.input + session.tokens.output + session.tokens.reasoning + session.tokens.cache.read + session.tokens.cache.write
+    if (tokens <= 0) return
+
+    const children = sync.data.session.filter((s) => s.parentID === session.id)
+    for (const child of children) {
+      if (child.tokens)
+        tokens +=
+          child.tokens.input + child.tokens.output + child.tokens.reasoning + child.tokens.cache.read + child.tokens.cache.write
+    }
+
+    return `${Locale.number(tokens)} total`
+  })
+
   const [store, setStore] = createStore<{
     prompt: PromptInfo
     mode: "normal" | "shell"
@@ -1738,7 +1757,7 @@ export function Prompt(props: PromptProps) {
                     <Match when={usage()}>
                       {(item) => (
                         <text fg={theme.textMuted} wrapMode="none">
-                          {[item().context, item().cost].filter(Boolean).join(" · ")}
+                          {[item().context, item().cost, cumulativeUsage()].filter(Boolean).join(" · ")}
                         </text>
                       )}
                     </Match>
