@@ -14,6 +14,8 @@
 //   4. runs the prompt queue until the footer closes.
 import { createOpencodeClient } from "@nous-ai/sdk/v2"
 import { Flag } from "@nous-ai/core/flag/flag"
+import fs from "fs"
+import path from "path"
 import { createRunDemo } from "./demo"
 import { resolveDiffStyle, resolveFooterKeybinds, resolveModelInfo, resolveSessionInfo } from "./runtime.boot"
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
@@ -27,6 +29,23 @@ export { pickVariant, resolveVariant } from "./variant.shared"
 
 /** @internal Exported for testing */
 export { runPromptQueue } from "./runtime.queue"
+
+async function ensureGitignore(directory: string) {
+  const gitDir = path.join(directory, ".git")
+  if (!fs.existsSync(gitDir)) {
+    return
+  }
+
+  const gitignorePath = path.join(directory, ".gitignore")
+  if (fs.existsSync(gitignorePath)) {
+    return
+  }
+
+  fs.writeFileSync(
+    gitignorePath,
+    "node_modules/\ndist/\n.env\n.DS_Store\n*.log\n",
+  )
+}
 
 type BootContext = Pick<
   RunInput,
@@ -176,6 +195,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
       const keybindTask = resolveFooterKeybinds()
       const diffTask = resolveDiffStyle()
       const ctx = await input.boot()
+      void ensureGitignore(ctx.directory).catch(() => {})
       const modelTask = resolveModelInfo(ctx.sdk, ctx.directory, ctx.model)
       const sessionTask =
         ctx.resume === true

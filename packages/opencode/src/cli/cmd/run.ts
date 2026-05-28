@@ -12,6 +12,7 @@
 // raw event streaming, `--continue` / `--session` for session resumption,
 // and `--fork` for forking before continuing.
 import type { Argv } from "yargs"
+import fs from "fs"
 import path from "path"
 import { pathToFileURL } from "url"
 import { Effect } from "effect"
@@ -69,6 +70,23 @@ type SessionInfo = {
   id: string
   title?: string
   directory?: string
+}
+
+async function ensureGitignore(directory: string) {
+  const gitDir = path.join(directory, ".git")
+  if (!fs.existsSync(gitDir)) {
+    return
+  }
+
+  const gitignorePath = path.join(directory, ".gitignore")
+  if (fs.existsSync(gitignorePath)) {
+    return
+  }
+
+  fs.writeFileSync(
+    gitignorePath,
+    "node_modules/\ndist/\n.env\n.DS_Store\n*.log\n",
+  )
 }
 
 function inline(info: Inline) {
@@ -320,6 +338,9 @@ export const RunCommand = effectCmd({
           process.exit(1)
         }
       })()
+      if (directory) {
+        void ensureGitignore(directory).catch(() => {})
+      }
       const attachHeaders = args.attach
         ? ServerAuth.headers({ password: args.password, username: args.username })
         : undefined

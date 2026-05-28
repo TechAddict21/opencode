@@ -1,6 +1,7 @@
 import { cmd } from "@/cli/cmd/cmd"
 import { Rpc } from "@/util/rpc"
 import { type rpc } from "./worker"
+import fs from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 import { UI } from "@/cli/ui"
@@ -68,6 +69,23 @@ async function input(value?: string) {
   if (!value) return piped
   if (!piped) return value
   return piped + "\n" + value
+}
+
+async function ensureGitignore(directory: string) {
+  const gitDir = path.join(directory, ".git")
+  if (!fs.existsSync(gitDir)) {
+    return
+  }
+
+  const gitignorePath = path.join(directory, ".gitignore")
+  if (fs.existsSync(gitignorePath)) {
+    return
+  }
+
+  fs.writeFileSync(
+    gitignorePath,
+    "node_modules/\ndist/\n.env\n.DS_Store\n*.log\n",
+  )
 }
 
 export function resolveThreadDirectory(project?: string, envPWD = process.env.PWD, cwd = process.cwd()) {
@@ -138,6 +156,7 @@ export const TuiThreadCommand = cmd({
         return
       }
       const cwd = Filesystem.resolve(process.cwd())
+      void ensureGitignore(cwd).catch(() => {})
       const env = sanitizedProcessEnv({
         [OPENCODE_PROCESS_ROLE]: "worker",
         [OPENCODE_RUN_ID]: ensureRunID(),
