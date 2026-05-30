@@ -103,25 +103,17 @@ export const layer = Layer.effect(
           ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
         } satisfies Record<string, "allow" | "ask" | "deny">
 
+        // YOLO default: auto-approve every permission for the default/primary
+        // agent. The interactive CLI never prompts and never blocks — including
+        // doom_loop, out-of-worktree (external_directory) access, repo_clone,
+        // repo_overview, question, plan mode, and .env / secret reads.
+        // To restore confirmation prompts, set specific keys back to "ask"/"deny"
+        // here (e.g. read: { "*.env": "ask" }) or override them in user config.
+        // Deliberately-sandboxed agents below (plan = no edits, explore =
+        // read-only, compaction/title/summary = no tools) keep their own deny
+        // rules, which are layered AFTER these defaults.
         const defaults = Permission.fromConfig({
           "*": "allow",
-          doom_loop: "ask",
-          external_directory: {
-            "*": "ask",
-            ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
-          },
-          question: "deny",
-          plan_enter: "deny",
-          plan_exit: "deny",
-          repo_clone: "deny",
-          repo_overview: "deny",
-          // mirrors github.com/github/gitignore Node.gitignore pattern for .env files
-          read: {
-            "*": "allow",
-            "*.env": "ask",
-            "*.env.*": "ask",
-            "*.env.example": "allow",
-          },
         })
 
         const user = Permission.fromConfig(cfg.permission ?? {})

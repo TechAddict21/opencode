@@ -1580,7 +1580,7 @@ export function Prompt(props: PromptProps) {
               syntaxStyle={syntax()}
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
-              <box flexDirection="row" gap={1}>
+              <box flexDirection="row" gap={1} flexShrink={1} overflow="hidden">
                 <Show when={local.agent.current()} fallback={<box height={1} />}>
                   {(agent) => (
                     <>
@@ -1602,12 +1602,59 @@ export function Prompt(props: PromptProps) {
                     </>
                   )}
                 </Show>
+                <Show when={status().type !== "idle" && status().type !== "retry"}>
+                  <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
+                    <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
+                  </Show>
+                </Show>
+                <Show when={status().type !== "idle" && status().type !== "retry"}>
+                  <text fg={store.interrupt > 0 ? theme.primary : theme.text}>
+                    esc{" "}
+                    <span style={{ fg: store.interrupt > 0 ? theme.primary : theme.textMuted }}>
+                      {store.interrupt > 0 ? "again to interrupt" : "interrupt"}
+                    </span>
+                  </text>
+                </Show>
               </box>
-              <Show when={hasRightContent()}>
-                <box flexDirection="row" gap={1} alignItems="center">
-                  {props.right}
-                </box>
-              </Show>
+              <box flexDirection="row" gap={2} alignItems="center" flexShrink={0}>
+                <Show when={status().type !== "retry"}>
+                  <box flexDirection="row" gap={2} alignItems="center">
+                    <Show when={editorContextLabelState() !== "none" ? editorFileLabelDisplay() : undefined}>
+                      {(file) => (
+                        <text fg={editorContextLabelState() === "pending" ? theme.secondary : theme.textMuted}>{file()}</text>
+                      )}
+                    </Show>
+                    <Switch>
+                      <Match when={store.mode === "normal"}>
+                        <Switch>
+                          <Match when={usage()}>
+                            {(item) => (
+                              <text fg={theme.textMuted} wrapMode="none">
+                                {[item().context, item().cost, cumulativeUsage()].filter(Boolean).join(" · ")}
+                              </text>
+                            )}
+                          </Match>
+                          <Match when={true}>
+                            <text fg={theme.text}>
+                              {agentShortcut()} <span style={{ fg: theme.textMuted }}>agents</span>
+                            </text>
+                          </Match>
+                        </Switch>
+                      </Match>
+                      <Match when={store.mode === "shell"}>
+                        <text fg={theme.text}>
+                          esc <span style={{ fg: theme.textMuted }}>exit shell mode</span>
+                        </text>
+                      </Match>
+                    </Switch>
+                  </box>
+                </Show>
+                <Show when={hasRightContent()}>
+                  <box flexDirection="row" gap={1} alignItems="center">
+                    {props.right}
+                  </box>
+                </Show>
+              </box>
             </box>
           </box>
         </box>
@@ -1637,9 +1684,10 @@ export function Prompt(props: PromptProps) {
             }
           />
         </box>
+        <Show when={status().type === "retry" || !!warpNotice() || !!workspaceLabel() || props.hint != null}>
         <box width="100%" flexDirection="row" justifyContent="space-between">
           <Switch>
-            <Match when={status().type !== "idle"}>
+            <Match when={status().type === "retry"}>
               <box
                 flexDirection="row"
                 gap={1}
@@ -1756,39 +1804,8 @@ export function Prompt(props: PromptProps) {
             </Match>
             <Match when={true}>{props.hint ?? <text />}</Match>
           </Switch>
-          <Show when={status().type !== "retry"}>
-            <box gap={2} flexDirection="row">
-              <Show when={editorContextLabelState() !== "none" ? editorFileLabelDisplay() : undefined}>
-                {(file) => (
-                  <text fg={editorContextLabelState() === "pending" ? theme.secondary : theme.textMuted}>{file()}</text>
-                )}
-              </Show>
-              <Switch>
-                <Match when={store.mode === "normal"}>
-                  <Switch>
-                    <Match when={usage()}>
-                      {(item) => (
-                        <text fg={theme.textMuted} wrapMode="none">
-                          {[item().context, item().cost, cumulativeUsage()].filter(Boolean).join(" · ")}
-                        </text>
-                      )}
-                    </Match>
-                    <Match when={true}>
-                      <text fg={theme.text}>
-                        {agentShortcut()} <span style={{ fg: theme.textMuted }}>agents</span>
-                      </text>
-                    </Match>
-                  </Switch>
-                </Match>
-                <Match when={store.mode === "shell"}>
-                  <text fg={theme.text}>
-                    esc <span style={{ fg: theme.textMuted }}>exit shell mode</span>
-                  </text>
-                </Match>
-              </Switch>
-            </box>
-          </Show>
         </box>
+        </Show>
       </box>
       <Autocomplete
         sessionID={props.sessionID}
