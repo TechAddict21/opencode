@@ -50,7 +50,7 @@ export interface Interface {
   readonly restore: (snapshot: string) => Effect.Effect<void>
   readonly revert: (patches: Patch[]) => Effect.Effect<void>
   readonly diff: (hash: string) => Effect.Effect<string>
-  readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  readonly diffFull: (from: string, to: string, context?: number) => Effect.Effect<FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
@@ -495,7 +495,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | AppProce
             )
           })
 
-          const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+          const diffFull = Effect.fnUntraced(function* (from: string, to: string, context = Number.MAX_SAFE_INTEGER) {
             return yield* locked(
               Effect.gen(function* () {
                 type Row = {
@@ -686,7 +686,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | AppProce
 
                 const step = 100
                 const patch = (file: string, before: string, after: string) =>
-                  formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+                  formatPatch(structuredPatch(file, file, before, after, "", "", { context }))
 
                 for (let i = 0; i < rows.length; i += step) {
                   const run = rows.slice(i, i + step)
@@ -746,8 +746,8 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | AppProce
         diff: Effect.fn("Snapshot.diff")(function* (hash: string) {
           return yield* InstanceState.useEffect(state, (s) => s.diff(hash))
         }),
-        diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string) {
-          return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to))
+        diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string, context?: number) {
+          return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to, context))
         }),
       })
     }),

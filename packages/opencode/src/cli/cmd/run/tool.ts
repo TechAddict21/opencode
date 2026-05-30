@@ -688,7 +688,7 @@ function scrollBashFinal(p: ToolProps<typeof BashTool>): string {
 
 function scrollReadStart(p: ToolProps<typeof ReadTool>): string {
   const file = toolPath(p.input.filePath)
-  const extra = info(p.frame.input, ["filePath"])
+  const extra = info(p.frame.input, ["filePath", "limit", "offset"])
   const tail = extra ? ` ${extra}` : ""
   return `→ Read ${file}${tail}`.trim()
 }

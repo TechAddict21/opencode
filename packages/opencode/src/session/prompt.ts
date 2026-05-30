@@ -66,6 +66,8 @@ import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@nous-ai/llm"
 import { Reviewer } from "@/reviewer/reviewer"
+import { CodeReviewer } from "@/reviewer/code-reviewer"
+import { Snapshot } from "@/snapshot"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -131,6 +133,8 @@ export const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const reviewer = yield* Reviewer.Service
+    const codeReviewer = yield* CodeReviewer.Service
+    const snapshot = yield* Snapshot.Service
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -1262,6 +1266,34 @@ export const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let reviewerIterations = 0
+        let codeReviewerIterations = 0
+        let lastReviewerUserID: MessageID | null = null
+        let lastCodeReviewerUserID: MessageID | null = null
+        // Working-tree snapshot taken at the start of the current genuine user
+        // turn, used to scope code review to only this turn's changes.
+        let turnBaselineSnapshot: string | undefined
+        let turnBaselineUserID: MessageID | null = null
+        // Attribute reviewer/fixer token usage to the turn's assistant message as
+        // a step-finish part, so it rolls into the session cumulative total (the
+        // projector sums step-finish parts). Without this, reviewer tokens are
+        // billed but invisible in the displayed total.
+        const recordReviewUsage = (
+          messageID: MessageID,
+          usage: { cost: number; tokens: MessageV2.StepFinishPart["tokens"] } | undefined,
+          reason: string,
+        ) =>
+          Effect.gen(function* () {
+            if (!usage) return
+            yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID,
+              sessionID,
+              type: "step-finish",
+              reason,
+              cost: usage.cost,
+              tokens: usage.tokens,
+            })
+          })
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1273,6 +1305,30 @@ export const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          // The latest genuine (non-synthetic) user message is the real request.
+          // Reviewer feedback below is injected as synthetic user messages, which
+          // must NOT be treated as new turns (else the iteration caps reset every
+          // loop and reviews could run forever).
+          const genuineUser = msgs.findLast(
+            (m) => m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic),
+          )
+          const genuineUserID = genuineUser?.info.id ?? lastUser.id
+          const genuineUserText = (genuineUser?.parts ?? [])
+            .filter((p): p is MessageV2.TextPart => p.type === "text" && !p.synthetic)
+            .map((p) => p.text)
+            .join("\n")
+            .trim()
+            .slice(0, 4000)
+
+          // Snapshot the working tree at the start of each genuine user turn —
+          // before the agent edits anything — so code review can be scoped to
+          // only this turn's changes (baseline → current), not earlier work.
+          if (genuineUserID !== turnBaselineUserID) {
+            turnBaselineUserID = genuineUserID
+            turnBaselineSnapshot = yield* snapshot.track().pipe(Effect.catch(() => Effect.succeed(undefined)))
+            yield* slog.info("turn.baseline", { genuineUserID, snapshot: turnBaselineSnapshot })
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1288,6 +1344,16 @@ export const layer = Layer.effect(
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
+            // Reset reviewer counters only on a new genuine user turn
+            if (lastReviewerUserID !== genuineUserID) {
+              reviewerIterations = 0
+              lastReviewerUserID = genuineUserID
+            }
+            if (lastCodeReviewerUserID !== genuineUserID) {
+              codeReviewerIterations = 0
+              lastCodeReviewerUserID = genuineUserID
+            }
+
             // Reviewer: check final response before presenting to user
             const cfg = yield* config.get()
             const reviewerConfig = cfg.reviewer
@@ -1314,7 +1380,10 @@ export const layer = Layer.effect(
                   throw new Error("No assistant message found")
                 }),
               )
-              const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+              const reviewerModelID = reviewerConfig?.model
+              const model = reviewerModelID
+                ? yield* getModel(lastUser.model.providerID, ModelID.make(reviewerModelID), sessionID)
+                : yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
 
               yield* slog.info("reviewer.running", {
                 sessionID,
@@ -1324,13 +1393,14 @@ export const layer = Layer.effect(
                 max: reviewerMaxIterations,
               })
 
-              const reviewResult = yield* reviewer.review({
+              const { result: reviewResult, usage: reviewerUsage } = yield* reviewer.review({
                 sessionID,
                 history: msgs,
                 finalMessage: freshAssistant,
                 model,
                 user: lastUser,
               })
+              yield* recordReviewUsage(freshAssistant.info.id, reviewerUsage, "text-review")
 
               reviewerIterations++
 
@@ -1458,6 +1528,78 @@ export const layer = Layer.effect(
               for (const part of currentAssistant.parts) {
                 if ((part.type === "text" || part.type === "reasoning") && part.ignored) {
                   yield* sessions.updatePart({ ...part, ignored: false })
+                }
+              }
+            }
+
+            // Code Reviewer: check modified files before presenting to user
+            const codeReviewerConfig = cfg.code_reviewer
+            const codeReviewerEnabled = codeReviewerConfig?.enabled ?? true
+            const codeReviewerMaxIterations = codeReviewerConfig?.max_iterations ?? 2
+            const directory = ctx.directory
+
+            if (
+              codeReviewerEnabled &&
+              directory &&
+              codeReviewerIterations < codeReviewerMaxIterations
+            ) {
+              codeReviewerIterations++
+              const codeReviewerModelID = codeReviewerConfig?.model
+              const codeReviewModel = codeReviewerModelID
+                ? yield* getModel(lastUser.model.providerID, ModelID.make(codeReviewerModelID), sessionID)
+                : yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+              // Surface "Reviewing" in the UI for the FILE reviewers only (not the
+              // text reviewer above, which keeps the normal busy label).
+              yield* status.set(sessionID, { type: "busy", label: "reviewing" })
+              const { result: codeReviewResult, usage: codeReviewUsage } = yield* codeReviewer.review({
+                sessionID,
+                directory,
+                user: lastUser,
+                model: codeReviewModel,
+                userRequirement: genuineUserText,
+                baselineSnapshot: turnBaselineSnapshot,
+              })
+              yield* status.set(sessionID, { type: "busy" })
+              yield* recordReviewUsage(lastAssistant.id, codeReviewUsage, "code-review")
+
+              if (codeReviewResult?.need_changes) {
+                // The full-stack fixer returns an actionable fix plan, not chat
+                // prose. Inject it as a synthetic user turn so the main agent —
+                // which has real edit tools — applies the fixes to the files and
+                // then re-enters review (bounded by max_iterations).
+                const fixPlan = codeReviewResult.refined_response?.trim() || codeReviewResult.feedback?.trim()
+
+                if (fixPlan) {
+                  yield* slog.info("code-reviewer.injecting-fixes", {
+                    length: fixPlan.length,
+                    iteration: codeReviewerIterations,
+                    max: codeReviewerMaxIterations,
+                    sessionID,
+                  })
+
+                  const codeReviewMsg: MessageV2.User = {
+                    id: MessageID.ascending(),
+                    role: "user",
+                    sessionID,
+                    time: { created: Date.now() },
+                    tools: {},
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                  }
+                  const codeReviewPart: MessageV2.TextPart = {
+                    id: PartID.ascending(),
+                    messageID: codeReviewMsg.id,
+                    sessionID,
+                    type: "text",
+                    text:
+                      "Automated code review found issues in the changes you just made. " +
+                      "Apply these fixes directly to the files using your editing tools, then briefly confirm what you changed:\n\n" +
+                      fixPlan,
+                    synthetic: true,
+                  }
+                  yield* sessions.updateMessage(codeReviewMsg)
+                  yield* sessions.updatePart(codeReviewPart)
+                  continue
                 }
               }
             }
@@ -1620,7 +1762,7 @@ export const layer = Layer.effect(
               .join("\n") ?? ""
             if (userText.trim() && lastUserMsg) {
               knowledgeContext = yield* knowledge
-                .feeder(userText, lastUserMsg.info.id)
+                .feeder(userText, lastUserMsg.info.id, sessionID)
                 .pipe(Effect.catch(() => Effect.succeed(null)))
             }
 
@@ -1922,6 +2064,8 @@ export const defaultLayer = Layer.suspend(() =>
         LLM.defaultLayer,
         Reference.defaultLayer,
         Reviewer.defaultLayer,
+        CodeReviewer.defaultLayer,
+        Snapshot.defaultLayer,
         Bus.layer,
         CrossSpawnSpawner.defaultLayer,
         RuntimeFlags.defaultLayer,

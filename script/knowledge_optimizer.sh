@@ -11,7 +11,8 @@ set -euo pipefail
 #
 # Features:
 #   - Auto-discovers ts/tsx/js/jsx/json/py files
-#   - Processes files in batches of 3 for efficiency
+#   - Processes files in directory-grouped batches (BATCH_SIZE) so each batch
+#     maps to a single knowledge area
 #   - Maintains state in internal_checks/knowledge_optimizer.json
 #   - Tracks failures in internal_checks/failed.txt
 #   - Respects --hours cooldown between re-processing
@@ -142,7 +143,7 @@ Arguments:
     TARGET_DIR      Target project directory (optional, will prompt if missing)
 
 Options:
-    --limit N       Maximum files to process per run (default: 90)
+    --limit N       Maximum files to process per run (default: 100)
     --hours H       Minimum hours since last processing before re-processing
                     (default: 720 = 30 days)
     --help, -h      Show this help message
@@ -158,8 +159,9 @@ Files created in TARGET_DIR:
     internal_checks/failed.txt                 Failure log
 
 Notes:
-    - Files are processed in batches of 3 for efficiency
-    - Each batch runs: nous run "what is the use of "file1", "file2", "file3""
+    - Files are grouped by directory, then processed in batches of BATCH_SIZE
+      (a batch never spans two directories, so each maps to one knowledge area)
+    - Each batch runs: nous run "what is the use of "file1", "file2", ..."
 EOF
 }
 
@@ -357,24 +359,38 @@ select_files() {
         fi
     done < "$TEMP_FILES"
 
-    # Sort: priority (0=never, 1=old), then by timestamp (oldest first)
-    # Format: priority|epoch|path
-    local sorted_file
-    sorted_file=$(mktemp)
-    sort -t'|' -k1,1n -k2,2n "$selected_file" > "$sorted_file"
+    # Group selected files by DIRECTORY so each batch maps to one knowledge area
+    # (the completer captures one area per run, so a batch of unrelated files
+    # produces an incoherent area). Files in a dir stay contiguous; dirs are
+    # ordered by their best (lowest priority/epoch) file so never-processed code
+    # is still picked up first.
+    # Input rows: priority|epoch|path. Output rows (sorted):
+    #   dirMinPriority|dirMinEpoch|dir|priority|epoch|path
+    local grouped_file
+    grouped_file=$(mktemp)
+    awk -F'|' '
+        {
+            pri=$1; ep=$2; rel=$3
+            dir=rel; sub(/\/[^\/]*$/, "", dir); if (dir==rel) dir="."
+            cand=sprintf("%d|%015d", pri, ep)
+            if (dmin[dir]=="" || cand<dmin[dir]) dmin[dir]=cand
+            n++; R[n]=dir "|" pri "|" ep "|" rel
+        }
+        END { for (i=1;i<=n;i++) { split(R[i],a,"|"); print dmin[a[1]] "|" R[i] } }
+    ' "$selected_file" | sort -t'|' -k1,1n -k2,2n -k3,3 -k4,4n -k5,5n > "$grouped_file"
 
     local selected_count=0
     SELECTED_FILES=()
-    while IFS='|' read -r _ _ filepath; do
+    while IFS='|' read -r _ _ _ _ _ filepath; do
         if [[ -n "$filepath" && $selected_count -lt $LIMIT ]]; then
             SELECTED_FILES+=("$filepath")
             selected_count=$((selected_count + 1))
         fi
-    done < "$sorted_file"
+    done < "$grouped_file"
 
     log "Selected $selected_count files for processing"
 
-    rm -f "$selected_file" "$sorted_file"
+    rm -f "$selected_file" "$grouped_file"
 }
 
 # Update state with success for multiple files
@@ -477,11 +493,21 @@ run_loop() {
     while [[ $i -lt $total ]]; do
         batch_idx=$((batch_idx + 1))
 
-        # Build batch array
+        # Build batch array. A batch never spans two directories — same-dir files
+        # are contiguous (see select_files), so breaking on a dirname change keeps
+        # each batch within one area, matching the completer's one-area-per-run.
         local batch=()
         local j=0
+        local batch_dir=""
         while [[ $j -lt $BATCH_SIZE && $i -lt $total ]]; do
-            batch+=("${SELECTED_FILES[$i]}")
+            local f="${SELECTED_FILES[$i]}"
+            local fdir
+            fdir="$(dirname "$f")"
+            if [[ $j -gt 0 && "$fdir" != "$batch_dir" ]]; then
+                break
+            fi
+            batch_dir="$fdir"
+            batch+=("$f")
             i=$((i + 1))
             j=$((j + 1))
         done

@@ -1340,7 +1340,6 @@ function UserMessage(props: {
 
 function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
   const ctx = use()
-  const local = useLocal()
   const { theme } = useTheme()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
@@ -1394,22 +1393,11 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
         <Match when={props.last || final() || props.message.error?.name === "MessageAbortedError"}>
           <box paddingLeft={3}>
             <text marginTop={1}>
-              <span
-                style={{
-                  fg:
-                    props.message.error?.name === "MessageAbortedError"
-                      ? theme.textMuted
-                      : local.agent.color(props.message.agent),
-                }}
-              >
-                ▣{" "}
-              </span>{" "}
-              <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
               <Show when={duration()}>
-                <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
+                <span style={{ fg: theme.textMuted }}>{Locale.duration(duration())}</span>
               </Show>
               <Show when={props.message.error?.name === "MessageAbortedError"}>
-                <span style={{ fg: theme.textMuted }}> · interrupted</span>
+                <span style={{ fg: theme.textMuted }}>{duration() ? " · " : ""}interrupted</span>
               </Show>
             </text>
           </box>
@@ -1754,11 +1742,14 @@ function BlockTool(props: {
   onClick?: () => void
   part?: ToolPart
   spinner?: boolean
+  collapsible?: boolean
 }) {
   const { theme } = useTheme()
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
+  const [expanded, setExpanded] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  const clickable = createMemo(() => props.collapsible || !!props.onClick)
   return (
     <box
       border={["left"]}
@@ -1770,10 +1761,11 @@ function BlockTool(props: {
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
       borderColor={theme.background}
-      onMouseOver={() => props.onClick && setHover(true)}
+      onMouseOver={() => clickable() && setHover(true)}
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
         if (renderer.getSelection()?.getSelectedText()) return
+        if (props.collapsible) setExpanded((prev) => !prev)
         props.onClick?.()
       }}
     >
@@ -1782,12 +1774,15 @@ function BlockTool(props: {
         fallback={
           <text paddingLeft={3} fg={theme.textMuted}>
             {props.title}
+            <Show when={props.collapsible}>
+              <span> ({expanded() ? "click to collapse" : "click to expand"})</span>
+            </Show>
           </text>
         }
       >
         <Spinner color={theme.textMuted}>{props.title.replace(/^# /, "")}</Spinner>
       </Show>
-      {props.children}
+      <Show when={!props.collapsible || expanded()}>{props.children}</Show>
       <Show when={error()}>
         <text fg={theme.error}>{error()}</text>
       </Show>
@@ -1859,7 +1854,7 @@ function Write(props: ToolProps<typeof WriteTool>) {
   return (
     <Switch>
       <Match when={props.metadata.diagnostics !== undefined}>
-        <BlockTool title={"# Wrote " + pathFormatter.format(props.input.filePath)} part={props.part}>
+        <BlockTool title={"# Wrote " + pathFormatter.format(props.input.filePath)} part={props.part} collapsible>
           <line_number fg={theme.textMuted} minWidth={3} paddingRight={1}>
             <code
               conceal={false}
@@ -1908,7 +1903,7 @@ function Read(props: ToolProps<typeof ReadTool>) {
         spinner={isRunning()}
         part={props.part}
       >
-        Read {pathFormatter.format(props.input.filePath)} {input(props.input, ["filePath"])}
+        Read {pathFormatter.format(props.input.filePath)}
       </InlineTool>
       <For each={loaded()}>
         {(filepath) => (
@@ -2048,7 +2043,7 @@ function Edit(props: ToolProps<typeof EditTool>) {
   return (
     <Switch>
       <Match when={props.metadata.diff !== undefined}>
-        <BlockTool title={"← Edit " + pathFormatter.format(props.input.filePath)} part={props.part}>
+        <BlockTool title={"← Edit " + pathFormatter.format(props.input.filePath)} part={props.part} collapsible>
           <box paddingLeft={1}>
             <diff
               diff={diffContent()}

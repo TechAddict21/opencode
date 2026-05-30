@@ -294,8 +294,64 @@ export const Info = Schema.Struct({
       max_iterations: Schema.optional(NonNegativeInt).annotate({
         description: "Maximum reviewer iterations per turn (default: 3)",
       }),
+      model: Schema.optional(Schema.String).annotate({
+        description: "Model override for reviewer (e.g. 'gpt-4o-mini'). Uses session model if not set.",
+      }),
     }),
   ).annotate({ description: "Reviewer configuration for peer-reviewing assistant responses" }),
+  code_reviewer: Schema.optional(
+    Schema.Struct({
+      enabled: Schema.optional(Schema.Boolean).annotate({
+        description: "Enable code review flow after file modifications (default: true)",
+      }),
+      max_files: Schema.optional(NonNegativeInt).annotate({
+        description:
+          "Skip code review unless MORE than this many files changed (default: 0 — review any change; e.g. 1 requires 2+ files)",
+      }),
+      max_iterations: Schema.optional(NonNegativeInt).annotate({
+        description: "Maximum code review iterations per turn (default: 2)",
+      }),
+      model: Schema.optional(Schema.String).annotate({
+        description: "Model override for code reviewer (e.g. 'gpt-4o-mini'). Uses session model if not set.",
+      }),
+      reviewer_timeout: Schema.optional(NonNegativeInt).annotate({
+        description: "Per-category reviewer LLM timeout in seconds (default: 90)",
+      }),
+      fixer_timeout: Schema.optional(NonNegativeInt).annotate({
+        description: "Full-stack fixer LLM timeout in seconds (default: 300). Raise for slow models / large changesets.",
+      }),
+      fixer_small: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run the full-stack fixer on the fast/small model (default: true). The experts already did the analysis, so consolidation is cheap; set false to use the main model (slower, may over-reason).",
+      }),
+      design_review: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra UI/UX design reviewer on changed UI files (default: true). Flags generic/raw UI and pushes for distinctive design (pairs with the frontend-design skill).",
+      }),
+      functional_review: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra holistic UI functional-completeness reviewer on changed UI files (default: true). Flags dead/stub controls (console.log-only handlers, no onClick) and missing shared state/data layer so mutations actually persist across views.",
+      }),
+      curl_testing: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra curl/API-test reviewer on changed API files (default: true). Plans safe curl tests for the main agent to run, reusing auth/base-URL from a CURL_TESTING.md in the project root.",
+      }),
+      batch_size: Schema.optional(NonNegativeInt).annotate({
+        description:
+          "Max files per reviewer call (default: 6). Large categories are split into parallel batches so a single agent is never overwhelmed by 20+ files. 0 disables batching.",
+      }),
+      concurrency: Schema.optional(NonNegativeInt).annotate({
+        description: "Max reviewer batches running in parallel (default: 5). Lower it if you hit provider rate limits.",
+      }),
+      triage: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run a master decision-maker before the specialist panel (default: true). One fast call inspects the user request + diff and decides which reviewers (if any) to run, so trivial edits (null guards, typos, renames) skip review and irrelevant specialists don't fire. Set false to always run the full panel.",
+      }),
+      triage_timeout: Schema.optional(NonNegativeInt).annotate({
+        description: "Triage decision-maker LLM timeout in seconds (default: 45).",
+      }),
+    }),
+  ).annotate({ description: "Code reviewer configuration for reviewing file modifications" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),

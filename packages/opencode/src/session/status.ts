@@ -27,6 +27,9 @@ export const Info = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("busy"),
+    // Optional sub-state label so the UI can show e.g. "Reviewing" instead of
+    // the agent's name while a background phase (code review) runs.
+    label: Schema.optional(Schema.String),
   }),
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>

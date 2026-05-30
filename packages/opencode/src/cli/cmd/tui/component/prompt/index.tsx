@@ -148,6 +148,18 @@ export function Prompt(props: PromptProps) {
   const dialog = useDialog()
   const toast = useToast()
   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
+  const isBusy = createMemo(() => status().type === "busy" || status().type === "retry")
+  const agentDisplayName = (name: string) => {
+    if (!isBusy()) return Locale.titlecase(name)
+    // The server tags the busy state with label "reviewing" while the file
+    // reviewers run — show that instead of the agent name.
+    const s = status() as { type: string; label?: string }
+    if (s.type === "busy" && s.label === "reviewing") return "Reviewing"
+    const lower = name.toLowerCase()
+    if (lower === "build") return "Building"
+    if (lower === "plan") return "Planning"
+    return Locale.titlecase(name)
+  }
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
@@ -1573,7 +1585,7 @@ export function Prompt(props: PromptProps) {
                   {(agent) => (
                     <>
                       <text fg={fadeColor(highlight(), agentMetaAlpha())}>
-                        {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
+                        {store.mode === "shell" ? "Shell" : agentDisplayName(agent().name)}
                       </text>
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>

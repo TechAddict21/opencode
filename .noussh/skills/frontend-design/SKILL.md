@@ -34,6 +34,15 @@ Focus on:
 
 NEVER use generic AI-generated aesthetics like overused font families (Inter, Roboto, Arial, system fonts), cliched color schemes (particularly purple gradients on white backgrounds), predictable layouts and component patterns, and cookie-cutter design that lacks context-specific character.
 
+**NEVER use these AI-slop tells (instant giveaways of generated UI):**
+- The **Sparkles / sparkle / ✨ icon** (lucide `Sparkles`, `Wand2`, `WandSparkles`, magic wand, stars) to denote "AI", "magic", "smart", or "premium" — and never as button/badge/logo decoration. Use a domain-appropriate icon or a plain typographic label instead.
+- **Bot / robot avatars** (lucide `Bot`, 🤖) for an assistant — use a restrained product mark.
+- **Emoji as UI icons/affordances** (✨🚀🔥💡🎉⚡👍) in buttons, headings, empty states, toasts.
+- **"AI-powered" / "Powered by AI" / "✨ Ask AI" badges**, glowing/gradient "AI" pills, shimmer "magic" buttons.
+- **Gradient text** (`bg-clip-text text-transparent`) and purple→pink/indigo/violet hero gradients; rainbow/holographic fills; glassmorphism everywhere.
+- Cliché stand-in icons (rocket="fast", lightning="speed", gear-only "settings") chosen without thought.
+Convey "AI"/intelligence through restraint, typography, motion, and information design — not a sparkle.
+
 Interpret creatively and make unexpected choices that feel genuinely designed for the context. No design should be the same. Vary between light and dark themes, different fonts, different aesthetics. NEVER converge on common choices (Space Grotesk, for example) across generations.
 
 **IMPORTANT**: Match implementation complexity to the aesthetic vision. Maximalist designs need elaborate code with extensive animations and effects. Minimalist or refined designs need restraint, precision, and careful attention to spacing, typography, and subtle details. Elegance comes from executing the vision well.

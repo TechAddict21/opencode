@@ -7,9 +7,12 @@ import { SessionID } from "@/session/schema"
 import * as Log from "@nous-ai/core/util/log"
 import * as Stream from "effect/Stream"
 import { Effect, Layer, Context, Schema, Option } from "effect"
-import { LLMEvent } from "@nous-ai/llm"
+import { LLMEvent, Usage } from "@nous-ai/llm"
 import { Agent } from "@/agent/agent"
+import { Session } from "@/session/session"
 import PROMPT_REVIEWER from "./prompt.txt"
+import { extractJsonObject } from "./util"
+import { ReviewLog } from "./review-log"
 
 const log = Log.create({ service: "reviewer" })
 
@@ -29,7 +32,7 @@ export interface Interface {
     finalMessage: MessageV2.WithParts
     model: Provider.Model
     user: MessageV2.User
-  }) => Effect.Effect<ReviewResult | null>
+  }) => Effect.Effect<{ result: ReviewResult | null; usage?: ReturnType<typeof Session.getUsage> }>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Reviewer") {}
@@ -48,29 +51,6 @@ function extractReasoningFromMessage(msg: MessageV2.WithParts): string {
     .filter((p): p is MessageV2.ReasoningPart => p.type === "reasoning")
     .map((p) => p.text)
     .join("\n")
-}
-
-function extractJsonObject(text: string): unknown | null {
-  const trimmed = text.trim()
-  // Try to find JSON object between curly braces
-  let depth = 0
-  let start = -1
-  for (let i = 0; i < trimmed.length; i++) {
-    if (trimmed[i] === "{") {
-      if (depth === 0) start = i
-      depth++
-    } else if (trimmed[i] === "}") {
-      depth--
-      if (depth === 0 && start !== -1) {
-        try {
-          return JSON.parse(trimmed.slice(start, i + 1))
-        } catch {
-          // Continue searching
-        }
-      }
-    }
-  }
-  return null
 }
 
 export const layer = Layer.effect(
@@ -101,7 +81,7 @@ export const layer = Layer.effect(
 
       if (!enabled) {
         log.info("reviewer.disabled", { sessionID: input.sessionID })
-        return null
+        return { result: null, usage: undefined }
       }
 
       // Get recent user/assistant turns (last 4)
@@ -121,13 +101,16 @@ export const layer = Layer.effect(
 
       if (!finalText.trim() && !finalReasoning.trim()) {
         log.info("reviewer.empty-final-text", { sessionID: input.sessionID })
-        return null
+        return { result: null, usage: undefined }
       }
 
+      // Function replacements: the values are arbitrary message/diff text that
+      // may contain `$&`, `$1`, … which String.replace would otherwise treat as
+      // special patterns and corrupt. A replacer fn inserts the value literally.
       const reviewPrompt = PROMPT_REVIEWER
-        .replace("{history_text}", historyText)
-        .replace("{final_text}", finalText || "[No text response]")
-        .replace("{final_reasoning}", finalReasoning || "[No reasoning/thinking]")
+        .replace("{history_text}", () => historyText)
+        .replace("{final_text}", () => finalText || "[No text response]")
+        .replace("{final_reasoning}", () => finalReasoning || "[No reasoning/thinking]")
 
       log.info("reviewer.calling-llm", {
         sessionID: input.sessionID,
@@ -145,82 +128,86 @@ export const layer = Layer.effect(
         options: {},
       }
 
-      let raw: string
-      try {
-        raw = yield* llm
-          .stream({
-            agent: reviewAgent,
-            user: input.user,
-            system: ["You are a helpful code reviewer. Respond only with valid JSON."],
-            small: true,
-            tools: {},
-            model: input.model,
-            sessionID: input.sessionID,
-            retries: 0,
-            messages: [{ role: "user", content: reviewPrompt }],
-          })
-          .pipe(
-            Stream.filter(LLMEvent.is.textDelta),
-            Stream.map((e) => e.text),
-            Stream.mkString,
-            Effect.timeout("60 seconds"),
-            Effect.catch((error: unknown) => {
-              log.warn("reviewer.llm-failed", {
-                error: String(error),
-                sessionID: input.sessionID,
-              })
-              return Effect.succeed("")
-            }),
-          )
-      } catch (error) {
-        log.warn("reviewer.llm-exception", {
-          error: String(error),
+      const started = Date.now()
+      let raw = ""
+      let rawUsage: Usage | undefined
+      let streamError: string | undefined
+      yield* llm
+        .stream({
+          agent: reviewAgent,
+          user: input.user,
+          system: ["You are a helpful code reviewer. Respond only with valid JSON."],
+          small: true,
+          tools: {},
+          model: input.model,
           sessionID: input.sessionID,
+          retries: 0,
+          messages: [{ role: "user", content: reviewPrompt }],
         })
-        return null
+        .pipe(
+          Stream.runForEach((e) =>
+            Effect.sync(() => {
+              if (LLMEvent.is.textDelta(e)) raw += e.text
+              else if (LLMEvent.is.stepFinish(e)) {
+                if (e.usage) rawUsage = e.usage
+              } else if (LLMEvent.is.finish(e)) {
+                if (e.usage) rawUsage = e.usage
+              }
+            }),
+          ),
+          Effect.timeout("60 seconds"),
+          Effect.catch((error: unknown) =>
+            Effect.sync(() => {
+              streamError = String(error)
+              log.warn("reviewer.llm-failed", { error: String(error), sessionID: input.sessionID })
+            }),
+          ),
+        )
+      const durationMs = Date.now() - started
+      // usage = cost + normalized tokens for the session cumulative total.
+      const usage = rawUsage ? Session.getUsage({ model: input.model, usage: rawUsage }) : undefined
+
+      const parsed = raw.trim() ? extractJsonObject(raw) : null
+      let result: ReviewResult | null = null
+      if (parsed && typeof parsed === "object") {
+        result = Option.getOrNull(Schema.decodeUnknownOption(ReviewResult)(parsed))
       }
 
-      log.info("reviewer.raw-response", {
-        raw: raw.slice(0, 500),
-        rawLength: raw.length,
-        sessionID: input.sessionID,
+      // Audit entry into this session's shared review log (same file as the
+      // code-review pipeline) — full input/output, tokens, timing, decision.
+      yield* ReviewLog.append(input.sessionID, {
+        phase: "text-reviewer",
+        agent: "reviewer",
+        model: `${input.model.providerID}/${input.model.id}`,
+        durationMs,
+        tokens: usage?.tokens,
+        inputChars: reviewPrompt.length,
+        input: reviewPrompt,
+        output: raw,
+        error: streamError,
+        parsed: Boolean(result),
+        need_changes: result?.need_changes ?? null,
+        has_refined: Boolean(result?.refined_response),
       })
 
-      if (!raw.trim()) {
-        log.warn("reviewer.empty-response", { sessionID: input.sessionID })
-        return null
-      }
-
-      const parsed = extractJsonObject(raw)
-      if (!parsed || typeof parsed !== "object") {
-        log.warn("reviewer.no-json", {
-          raw: raw.slice(0, 500),
+      if (!result) {
+        log.warn("reviewer.unusable-response", {
           sessionID: input.sessionID,
+          hasText: Boolean(raw.trim()),
+          error: streamError,
         })
-        return null
+        return { result: null, usage }
       }
 
-      const decoded = Schema.decodeUnknownOption(ReviewResult)(parsed)
-      if (Option.isNone(decoded)) {
-        log.warn("reviewer.decode-failed", {
-          raw: raw.slice(0, 500),
-          parsed,
-          sessionID: input.sessionID,
-        })
-        return null
-      }
-
-      const result = decoded.value
       log.info("reviewer.decision", {
         need_changes: result.need_changes,
         has_feedback: Boolean(result.feedback),
-        feedback_preview: result.feedback?.slice(0, 200),
         has_refined: Boolean(result.refined_response),
-        refined_preview: result.refined_response?.slice(0, 200),
+        durationMs,
         sessionID: input.sessionID,
       })
 
-      return result
+      return { result, usage }
     })
 
     return Service.of({ review })

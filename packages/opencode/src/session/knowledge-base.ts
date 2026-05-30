@@ -152,6 +152,36 @@ export function upsertAreaSection(treeContent: string, areaName: string, bodyLin
   return `${parts.join("\n\n")}\n`
 }
 
+// Normalize an area name for collision detection: lowercase, collapse internal
+// whitespace, strip a single trailing plural "s". Deliberately cheap and
+// conservative — it merges "Collection"/"Collections"/"collection" but never
+// "Disbursement"/"Disbursement Schedule".
+function normalizeAreaName(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/s$/, "")
+}
+
+/**
+ * If the tree already has an area whose name is a near-duplicate of `areaName`
+ * (case/whitespace/plural variant), return that existing area's EXACT name so
+ * the completer reuses its section instead of appending a second near-identical
+ * "## " header. Returns `areaName` unchanged when no existing area matches.
+ * Keeps the ONE-entry-per-area invariant against model naming drift.
+ */
+export function resolveCanonicalArea(treeContent: string, areaName: string): string {
+  const target = normalizeAreaName(areaName)
+  if (!target) return areaName
+  for (const m of treeContent.matchAll(/^##\s+(.+?)\s*$/gm)) {
+    const existing = m[1].trim()
+    if (existing.toLowerCase() === "skip") continue
+    if (normalizeAreaName(existing) === target) return existing
+  }
+  return areaName
+}
+
 // Matches a workspace-relative source path (has a slash and a file extension),
 // e.g. src/admin/foo.service.ts or src/x/model/ns.tudf.model.ts.
 const PATH_IN_TEXT = /(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z][\w]*/g

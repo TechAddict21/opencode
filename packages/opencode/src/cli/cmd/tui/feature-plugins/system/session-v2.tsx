@@ -301,7 +301,6 @@ function AssistantMessage(props: {
   start?: number
 }) {
   const { theme } = useTheme()
-  const local = useLocal()
   const duration = createMemo(() => {
     if (!props.message.time.completed) return 0
     return props.message.time.completed - (props.start ?? props.message.time.created)
@@ -349,10 +348,8 @@ function AssistantMessage(props: {
       <Show when={props.last || final() || props.message.error}>
         <box paddingLeft={3} flexShrink={0}>
           <text marginTop={1}>
-            <span style={{ fg: local.agent.color(props.message.agent) }}>▣ </span>
-            <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.agent)}</span>
             <Show when={duration()}>
-              <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
+              <span style={{ fg: theme.textMuted }}>{Locale.duration(duration())}</span>
             </Show>
           </text>
         </box>
@@ -655,11 +652,14 @@ function BlockTool(props: {
   part?: SessionMessageAssistantTool
   onClick?: () => void
   spinner?: boolean
+  collapsible?: boolean
 }) {
   const { theme } = useTheme()
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
+  const [expanded, setExpanded] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error.message : undefined))
+  const clickable = createMemo(() => props.collapsible || !!props.onClick)
   return (
     <box
       border={["left"]}
@@ -671,10 +671,11 @@ function BlockTool(props: {
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
       borderColor={theme.background}
-      onMouseOver={() => props.onClick && setHover(true)}
+      onMouseOver={() => clickable() && setHover(true)}
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
         if (renderer.getSelection()?.getSelectedText()) return
+        if (props.collapsible) setExpanded((prev) => !prev)
         props.onClick?.()
       }}
       flexShrink={0}
@@ -684,12 +685,15 @@ function BlockTool(props: {
         fallback={
           <text paddingLeft={3} fg={theme.textMuted}>
             {props.title}
+            <Show when={props.collapsible}>
+              <span> ({expanded() ? "click to collapse" : "click to expand"})</span>
+            </Show>
           </text>
         }
       >
         <Spinner color={theme.textMuted}>{props.title.replace(/^# /, "")}</Spinner>
       </Show>
-      {props.children}
+      <Show when={!props.collapsible || expanded()}>{props.children}</Show>
       <Show when={error()}>
         <text fg={theme.error}>{error()}</text>
       </Show>
@@ -820,7 +824,7 @@ function Write(props: ToolProps) {
   return (
     <Switch>
       <Match when={content() && props.part.state.status === "completed"}>
-        <BlockTool title={"# Wrote " + normalizePath(filePath())} part={props.part}>
+        <BlockTool title={"# Wrote " + normalizePath(filePath())} part={props.part} collapsible>
           <line_number fg={theme.textMuted} minWidth={3} paddingRight={1}>
             <code
               conceal={false}
@@ -846,7 +850,7 @@ function Edit(props: ToolProps) {
     <Switch>
       <Match when={diff()}>
         {(diff) => (
-          <BlockTool title={"← Edit " + normalizePath(filePath())} part={props.part}>
+          <BlockTool title={"← Edit " + normalizePath(filePath())} part={props.part} collapsible>
             <box paddingLeft={1}>
               <diff
                 diff={diff()}
