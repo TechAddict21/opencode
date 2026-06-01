@@ -49,6 +49,11 @@ type MessageRole = "assistant" | "user"
 type Dict = Record<string, unknown>
 type SessionCommit = StreamCommit
 
+type TpsSample = {
+  cumulativeTokens: number
+  timestamp: number
+}
+
 // Mutable accumulator for the reducer. Each field tracks a different aspect
 // of the stream so we can produce correct incremental output:
 //
@@ -84,6 +89,9 @@ export type SessionData = {
   sent: Map<string, number>
   end: Set<string>
   echo: Map<string, Set<string>>
+  tpsCumulativeOutput: number
+  tpsSamples: TpsSample[]
+  tpsTurnStart: number | null
 }
 
 export type SessionDataInput = {
@@ -121,6 +129,9 @@ export function createSessionData(
     sent: new Map(),
     end: new Set(),
     echo: new Map(),
+    tpsCumulativeOutput: 0,
+    tpsSamples: [],
+    tpsTurnStart: null,
   }
 }
 
@@ -155,6 +166,31 @@ function formatUsage(
   }
 
   return text
+}
+
+function formatTps(samples: TpsSample[], turnStart: number | null): string | undefined {
+  if (samples.length === 0) return undefined
+
+  const now = Date.now()
+
+  if (samples.length === 1 && turnStart != null) {
+    const elapsed = (now - turnStart) / 1000
+    if (elapsed <= 0.1) return undefined
+    const tps = samples[0].cumulativeTokens / elapsed
+    if (tps < 1) return undefined
+    return `${Math.round(tps)} tok/s`
+  }
+
+  if (samples.length < 2) return undefined
+
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  const tokenDiff = last.cumulativeTokens - first.cumulativeTokens
+  const timeDiffMs = last.timestamp - first.timestamp
+  if (timeDiffMs <= 0 || tokenDiff <= 0) return undefined
+  const tps = tokenDiff / (timeDiffMs / 1000)
+  if (tps < 1) return undefined
+  return `${Math.round(tps)} tok/s`
 }
 
 export function formatError(error: {
@@ -829,6 +865,11 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
     }
 
     if (info.role !== "assistant") {
+      if (info.role === "user") {
+        data.tpsTurnStart = null
+        data.tpsCumulativeOutput = 0
+        data.tpsSamples = []
+      }
       return out(data, commits)
     }
 
@@ -838,17 +879,20 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
-    const usage = formatUsage(
-      info.tokens,
-      input.limits[modelKey(info.providerID, info.modelID)],
-      typeof info.cost === "number" ? info.cost : undefined,
-    )
-    if (usage) {
-      next = {
-        ...next,
-        usage,
+    const outputTotal = (info.tokens?.output ?? 0) + (info.tokens?.reasoning ?? 0)
+    if (outputTotal > data.tpsCumulativeOutput) {
+      data.tpsCumulativeOutput = outputTotal
+      const last = data.tpsSamples[data.tpsSamples.length - 1]
+      if (!last || last.timestamp + 50 <= Date.now()) {
+        data.tpsSamples.push({ cumulativeTokens: outputTotal, timestamp: Date.now() })
+        if (data.tpsSamples.length > 10) data.tpsSamples.shift()
       }
     }
+
+    const limit = input.limits[modelKey(info.providerID, info.modelID)]
+    const usage = formatUsage(info.tokens, limit, info.cost)
+    const tps = formatTps(data.tpsSamples, data.tpsTurnStart)
+    next = { ...next, usage: usage && tps ? `${usage} · ${tps}` : (usage ?? tps) }
 
     if (typeof info.id === "string" && info.error && !isAbort(info.error) && !data.ids.has(msgErr(info.id))) {
       data.ids.add(msgErr(info.id))
@@ -879,6 +923,10 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
     if (event.properties.field !== "text") {
       return out(data, commits)
+    }
+
+    if (data.tpsTurnStart == null) {
+      data.tpsTurnStart = Date.now()
     }
 
     const partID = event.properties.partID

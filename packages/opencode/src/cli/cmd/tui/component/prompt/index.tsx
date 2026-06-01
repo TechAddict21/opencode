@@ -380,6 +380,37 @@ export function Prompt(props: PromptProps) {
     return `${Locale.number(tokens)} total`
   })
 
+  const tpsState = { turnStart: 0, lastMsgID: "" }
+
+  const tps = createMemo(() => {
+    if (!props.sessionID) return
+    const msg = sync.data.message[props.sessionID] ?? []
+    const last = msg.findLast((item) => item.role === "assistant")
+    if (!last) {
+      tpsState.turnStart = 0
+      tpsState.lastMsgID = ""
+      return
+    }
+
+    if (last.id !== tpsState.lastMsgID) {
+      tpsState.lastMsgID = last.id
+      tpsState.turnStart = Date.now()
+    }
+
+    if (!tpsState.turnStart) return
+
+    const tokens = last.tokens.output + last.tokens.reasoning
+    if (tokens <= 0) return
+
+    const elapsed = (Date.now() - tpsState.turnStart) / 1000
+    if (elapsed <= 0.1) return
+
+    const rate = tokens / elapsed
+    if (rate < 1) return
+
+    return `${Math.round(rate)} tok/s`
+  })
+
   const [store, setStore] = createStore<{
     prompt: PromptInfo
     mode: "normal" | "shell"
@@ -1630,7 +1661,7 @@ export function Prompt(props: PromptProps) {
                           <Match when={usage()}>
                             {(item) => (
                               <text fg={theme.textMuted} wrapMode="none">
-                                {[item().context, item().cost, cumulativeUsage()].filter(Boolean).join(" · ")}
+                                {[item().context, item().cost, cumulativeUsage(), tps()].filter(Boolean).join(" · ")}
                               </text>
                             )}
                           </Match>

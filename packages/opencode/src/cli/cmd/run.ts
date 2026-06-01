@@ -29,7 +29,6 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 
-const runtimeTask = import("./run/runtime")
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
 function pick(value: string | undefined): ModelInput | undefined {
@@ -839,35 +838,32 @@ export const RunCommand = effectCmd({
           return
         }
 
-        const model = pick(args.model)
-        const { runInteractiveMode } = await runtimeTask
-        try {
-          await runInteractiveMode({
-            sdk: client,
-            directory: cwd,
-            sessionID,
-            sessionTitle: sess.title,
-            resume: Boolean(args.session || args.continue) && !args.fork,
-            replay,
-            replayLimit: args["replay-limit"],
-            agent,
-            model,
-            variant: args.variant,
-            files,
-            initialInput,
-            createSession: createFreshSession,
-            thinking,
-            demo: args.demo,
-          })
-        } catch (error) {
-          dieInteractive(error)
-        }
-        return
-      }
+        const { TuiConfig } = await import("@/cli/cmd/tui/config/tui")
+        const { tui } = await import("@/cli/cmd/tui/app")
+        const tuiConfig = await TuiConfig.get()
 
-      if (args.interactive && !args.attach && !args.session && !args.continue) {
-        const model = pick(args.model)
-        const { runInteractiveLocalMode } = await runtimeTask
+        if (args.attach) {
+          const headers = ServerAuth.headers({ password: args.password, username: args.username })
+          try {
+            return await tui({
+              url: args.attach,
+              config: tuiConfig,
+              directory: directory ?? root,
+              headers,
+              args: {
+                continue: Boolean(args.session || args.continue) && !args.fork,
+                sessionID: args.session,
+                agent: args.agent,
+                model: args.model,
+                prompt: initialInput,
+                fork: args.fork,
+              },
+            })
+          } catch (error) {
+            dieInteractive(error)
+          }
+        }
+
         const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
           const { Server } = await import("@/server/server")
           const request = new Request(input, init)
@@ -875,22 +871,19 @@ export const RunCommand = effectCmd({
         }) as typeof globalThis.fetch
 
         try {
-          return await runInteractiveLocalMode({
+          return await tui({
+            url: "http://opencode.internal",
+            config: tuiConfig,
             directory: directory ?? root,
             fetch: fetchFn,
-            resolveAgent: localAgent,
-            session,
-            share,
-            createSession: createFreshSession,
-            agent: args.agent,
-            model,
-            variant: args.variant,
-            replay,
-            replayLimit: args["replay-limit"],
-            files,
-            initialInput,
-            thinking,
-            demo: args.demo,
+            args: {
+              continue: Boolean(args.session || args.continue) && !args.fork,
+              sessionID: args.session,
+              agent: args.agent,
+              model: args.model,
+              prompt: initialInput,
+              fork: args.fork,
+            },
           })
         } catch (error) {
           dieInteractive(error)
