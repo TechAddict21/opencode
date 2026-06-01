@@ -12,6 +12,11 @@ export async function upgrade() {
   const latest = await Installation.latest(method).catch(() => {})
   if (!latest) return
 
+  // Temporary commented
+  if (1 == 1) {
+    return
+  }
+
   if (Flag.OPENCODE_ALWAYS_NOTIFY_UPDATE) {
     GlobalBus.emit("event", {
       directory: "global",

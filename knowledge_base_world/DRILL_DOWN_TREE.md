@@ -9,3 +9,9 @@ Each area is a "## Area Name" header followed by one bullet:
   - **Area/Doc.md** — one-line description of the whole area
 
 No areas captured yet — the knowledge completer adds them as the codebase is explored.
+
+## Desktop Updater
+- **Desktop Updater/Desktop Updater.md** — Auto-update checking and download logic for the Electron desktop app using electron-updater.
+
+## CLI Updater
+- **CLI Updater/CLI Updater.md** — Auto-update checking and notification logic for the CLI tool, supporting multiple install methods (npm, brew, curl).
