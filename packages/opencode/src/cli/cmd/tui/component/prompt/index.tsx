@@ -156,7 +156,7 @@ export function Prompt(props: PromptProps) {
     const s = status() as { type: string; label?: string }
     if (s.type === "busy" && s.label === "reviewing") return "Reviewing"
     const lower = name.toLowerCase()
-    if (lower === "build") return "Building"
+    if (lower === "build") return "Processing"
     if (lower === "plan") return "Planning"
     return Locale.titlecase(name)
   }

@@ -54,7 +54,6 @@ import { useSDK } from "@tui/context/sdk"
 import { useEditorContext } from "@tui/context/editor"
 import { useDialog } from "../../ui/dialog"
 import { TodoItem } from "../../component/todo-item"
-import { DialogMessage } from "./dialog-message"
 import type { PromptInfo } from "../../component/prompt/history"
 import { DialogConfirm } from "@tui/ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
@@ -1154,16 +1153,6 @@ export function Session() {
                       <Match when={message.role === "user"}>
                         <UserMessage
                           index={index()}
-                          onMouseUp={() => {
-                            if (renderer.getSelection()?.getSelectedText()) return
-                            dialog.replace(() => (
-                              <DialogMessage
-                                messageID={message.id}
-                                sessionID={route.sessionID}
-                                setPrompt={(promptInfo) => prompt?.set(promptInfo)}
-                              />
-                            ))
-                          }}
                           message={message as UserMessage}
                           parts={sync.data.part[message.id] ?? []}
                           pending={pending()}
@@ -1235,7 +1224,7 @@ const MIME_BADGE: Record<string, string> = {
 function UserMessage(props: {
   message: UserMessage
   parts: Part[]
-  onMouseUp: () => void
+  onMouseUp?: () => void
   index: number
   pending?: string
 }) {

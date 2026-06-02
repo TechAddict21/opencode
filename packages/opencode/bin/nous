@@ -6,6 +6,9 @@ import path from "path"
 import os from "os"
 import { fileURLToPath } from "url"
 
+process.stderr.write("\x1b]0;nous\x07")
+process.title = "nous"
+
 const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"]
 
 function run(target) {
@@ -72,7 +75,7 @@ if (!arch) {
   arch = os.arch()
 }
 const base = "opencode-" + platform + "-" + arch
-const binary = platform === "windows" ? "opencode.exe" : "opencode"
+const binary = platform === "windows" ? "nous.exe" : "nous"
 
 function supportsAvx2() {
   if (arch !== "x64") return false
@@ -193,7 +196,7 @@ function findDistBinary() {
   if (!fs.existsSync(distDir)) return
 
   for (const name of names) {
-    const candidate = path.join(distDir, name, "bin", "opencode")
+    const candidate = path.join(distDir, name, "bin", "nous")
     if (fs.existsSync(candidate)) return candidate
   }
 }

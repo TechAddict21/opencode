@@ -62,7 +62,7 @@ find_native_binary() {
     local candidates=(
         "${REPO_DIR}/.noussh"
         "${PACKAGE_DIR}/.noussh"
-        "${PACKAGE_DIR}/dist/opencode-${platform}-${arch}/bin/opencode"
+        "${PACKAGE_DIR}/dist/opencode-${platform}-${arch}/bin/nous"
         "${REPO_DIR}/node_modules/opencode-${platform}-${arch}/bin/nous"
         "${REPO_DIR}/node_modules/opencode-${platform}-${arch}/bin/nous.exe"
     )

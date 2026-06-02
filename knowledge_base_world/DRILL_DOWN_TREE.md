@@ -10,8 +10,17 @@ Each area is a "## Area Name" header followed by one bullet:
 
 No areas captured yet — the knowledge completer adds them as the codebase is explored.
 
+## CLI Launch & Branding
+- **CLI Launch & Branding/CLI Launch & Branding.md** — How `nous` launches (`run.sh` → compiled binary or bun dev) and where the "nous" name surfaces; the terminal-tab name is the process executable name, so the binary filename in build.ts/run.sh/bin must stay in lockstep.
+
 ## Desktop Updater
 - **Desktop Updater/Desktop Updater.md** — Auto-update checking and download logic for the Electron desktop app using electron-updater.
 
 ## CLI Updater
 - **CLI Updater/CLI Updater.md** — Auto-update checking and notification logic for the CLI tool, supporting multiple install methods (npm, brew, curl).
+
+## TUI Prompt
+- **TUI Prompt/TUI Prompt.md** — TUI prompt component that renders agent status labels and busy-state display names.
+
+## TUI Session
+- **TUI Session/TUI Session.md** — TUI route that renders the interactive chat session view with message list, user input, and message action dialogs.
