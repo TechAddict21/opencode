@@ -6,14 +6,17 @@ import { Config } from "@/config/config"
 import { serviceUse } from "@/effect/service-use"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionID } from "@/session/schema"
+import { ChangeLedger } from "@/session/change-ledger"
 import * as Log from "@nous-ai/core/util/log"
 import * as Stream from "effect/Stream"
 import { Effect, Layer, Context, Schema, Option, Duration } from "effect"
 import { LLMEvent, Usage } from "@nous-ai/llm"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Agent } from "@/agent/agent"
 import { Git } from "@/git"
 import { Snapshot } from "@/snapshot"
 import { Session } from "@/session/session"
+import { CrossSpawnSpawner } from "@nous-ai/core/cross-spawn-spawner"
 import { ReviewLog } from "./review-log"
 import PROMPT_FRONTEND from "./prompts/frontend.txt"
 import PROMPT_BACKEND from "./prompts/backend.txt"
@@ -28,8 +31,18 @@ import PROMPT_SECURITY from "./prompts/security.txt"
 import PROMPT_DESIGN from "./prompts/design.txt"
 import PROMPT_FUNCTIONAL from "./prompts/functional.txt"
 import PROMPT_CURL from "./prompts/curl.txt"
+import PROMPT_CURL_JUDGE from "./prompts/curl-judge.txt"
 import PROMPT_TRIAGE from "./prompts/triage.txt"
 import PROMPT_FULL_STACK_FIXER from "./prompts/full-stack-fixer.txt"
+import PROMPT_CSS from "./prompts/css.txt"
+import PROMPT_TYPESCRIPT from "./prompts/typescript.txt"
+import PROMPT_JAVASCRIPT from "./prompts/javascript.txt"
+import PROMPT_PYTHON from "./prompts/python.txt"
+import PROMPT_GO from "./prompts/go.txt"
+import PROMPT_RUST from "./prompts/rust.txt"
+import PROMPT_JAVA from "./prompts/java.txt"
+import PROMPT_HTML from "./prompts/html.txt"
+import PROMPT_SHELL from "./prompts/shell.txt"
 import { extractJsonObject } from "./util"
 
 const log = Log.create({ service: "code-reviewer" })
@@ -56,6 +69,17 @@ type Category =
   | "design"
   | "functional"
   | "curl"
+  | "schema"
+  // Language/extension lenses: a file that matches no framework/path rule is
+  | "css"
+  | "typescript"
+  | "javascript"
+  | "python"
+  | "go"
+  | "rust"
+  | "java"
+  | "html"
+  | "shell"
 
 // Short, human-readable summary of what each reviewer covers — fed to the
 // triage decision-maker so it can route to the right specialists.
@@ -73,6 +97,16 @@ const CATEGORY_DESCRIPTIONS: Record<Category, string> = {
   design: "UI/UX visual quality & banned AI-slop tells (sparkle/bot/emoji icons)",
   functional: "UI functional completeness: dead controls, missing data layer, no-op handlers",
   curl: "Live API testing via curl for new/changed endpoints & business logic",
+  schema: "Holistic DB/schema integrity: every new entity/model/DTO column must be backed by a migration",
+  css: "CSS/SCSS/Sass/Less: specificity, layout, responsive/overflow, tokens, dead/duplicate rules",
+  typescript: "Generic TypeScript (no framework match): types, async/await, error handling, null-safety, exhaustiveness",
+  javascript: "Generic JavaScript (no framework match): correctness, async, equality/coercion, mutation, error handling",
+  python: "Python: idioms, typing, exceptions, mutable defaults, resource handling, async correctness",
+  go: "Go: error handling, goroutine/channel leaks, nil/zero values, defer, context cancellation",
+  rust: "Rust: ownership/borrow, Result/Option handling, unwrap/panic, lifetimes, unsafe blocks",
+  java: "Java: null-safety, resource/stream closing, equals/hashCode, concurrency, exception handling",
+  html: "HTML: semantics, accessibility (labels/alt/roles), form correctness, broken structure",
+  shell: "Shell scripts: quoting, `set -euo pipefail`, error handling, unsafe expansions, injection",
 }
 
 // Triage decision: which specialists (if any) actually apply to THIS turn's diff.
@@ -160,7 +194,7 @@ interface FileGroup {
 
 // Holistic lenses must see ALL their files together (they reason across files),
 // so they are never split into batches. Per-file code experts ARE batched.
-const HOLISTIC_CATEGORIES = new Set<Category>(["design", "functional", "curl"])
+const HOLISTIC_CATEGORIES = new Set<Category>(["design", "functional", "curl", "schema"])
 
 // Split big per-category expert groups into batches of `size` so no single
 // reviewer call gets more than `size` files. Holistic lenses pass through whole.
@@ -191,6 +225,10 @@ export interface Interface {
     // the review is scoped to changes made during the turn (diff baseline→now).
     // When absent (snapshots disabled), falls back to a whole-tree diff vs HEAD.
     baselineSnapshot?: string
+    // Wall-clock captured at the START of this user turn. Used to turn-scope the
+    // change-ledger fallback when there is no git baseline (non-git launch dir):
+    // only files written/edited at or after this time count as this turn's work.
+    baselineTime?: number
   }) => Effect.Effect<{ result: CodeReviewResult | null; usage?: Account }>
 }
 
@@ -201,6 +239,12 @@ export const use = serviceUse(Service)
 function categorizeFile(file: string): Category {
   const lower = file.toLowerCase()
   const ext = lower.split(".").pop() || ""
+
+  // Presentational files route purely by extension — no framework/path rule
+  // should outrank a dedicated stylesheet/markup reviewer (a `.css` under
+  // /styles/ or /components/ is still a stylesheet).
+  if (["css", "scss", "sass", "less"].includes(ext)) return "css"
+  if (["html", "htm"].includes(ext)) return "html"
 
   // Check framework-specific patterns FIRST to avoid false positives
 
@@ -245,6 +289,7 @@ function categorizeFile(file: string): Category {
     lower.includes("/providers/") ||
     lower.includes("/router/") ||
     lower.includes(".tsx") ||
+    lower.includes(".jsx") ||
     (lower.includes("/components/") && ext === "tsx") ||
     (lower.includes("/hooks/") && ext === "ts") ||
     lower.includes("useeffect") ||
@@ -291,9 +336,29 @@ function categorizeFile(file: string): Category {
     return "postgresql"
   }
 
-  // FRONTEND: General frontend files
+  // ORM MODELS/ENTITIES: route entity/model/schema files (and Sequelize/TypeORM)
+  // to the DB reviewer so column/type/constraint/relation changes get reviewed
+  // with database expertise instead of as generic TS — and they ALSO get the
+  // holistic `schema` lens (isSchemaFile) that cross-checks new columns ↔
+  // migrations. Without this a bare `user.model.ts` would fall to `typescript`.
   if (
-    ["html", "htm", "css", "scss", "sass", "less", "js", "jsx", "vue", "svelte", "svg", "png", "jpg", "jpeg", "gif", "webp"].includes(ext) ||
+    lower.endsWith(".entity.ts") ||
+    lower.endsWith(".model.ts") ||
+    lower.endsWith(".schema.ts") ||
+    lower.endsWith(".entity.js") ||
+    lower.endsWith(".model.js") ||
+    lower.endsWith(".schema.prisma") ||
+    lower.includes("sequelize") ||
+    lower.includes("typeorm")
+  ) {
+    return "database"
+  }
+
+  // FRONTEND: Component/asset frontend files. Language extensions (css/scss/
+  // less, html, js) are intentionally NOT here — they fall through to the
+  // dedicated per-language lenses below so each gets an in-depth reviewer.
+  if (
+    ["vue", "svelte", "svg", "png", "jpg", "jpeg", "gif", "webp"].includes(ext) ||
     lower.includes("/styles/") ||
     lower.includes("/assets/") ||
     lower.includes("/public/") ||
@@ -415,6 +480,34 @@ function categorizeFile(file: string): Category {
     return "backend"
   }
 
+  // Per-language lenses — reached only when no framework/path rule matched, so a
+  // service/api `.ts` already became `backend` above and stays there; this only
+  // catches generic, framework-agnostic source files and gives each its own
+  // in-depth reviewer instead of dumping them all into `general`.
+  switch (ext) {
+    case "py":
+    case "pyi":
+      return "python"
+    case "go":
+      return "go"
+    case "rs":
+      return "rust"
+    case "java":
+      return "java"
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "shell"
+    case "ts":
+    case "mts":
+    case "cts":
+      return "typescript"
+    case "js":
+    case "mjs":
+    case "cjs":
+      return "javascript"
+  }
+
   return "general"
 }
 
@@ -434,29 +527,32 @@ function isUIFile(file: string): boolean {
   )
 }
 
-// Files that add or change observable API surface (HTTP/GraphQL endpoints or the
-// business logic behind them) get an extra curl/API-test lens. Heuristic only.
-function isAPIFile(file: string): boolean {
+// Files that can introduce or alter a PERSISTED column/field — entities, ORM
+// models, schema definitions, migrations, and the DTOs that mirror them. These
+// get an extra holistic schema lens so a column added to a model/DTO is always
+// cross-checked against a migration that actually creates it in the DB. The
+// per-file `categorizeFile` would otherwise route `*.model.ts` → general and
+// `*.dto.ts` → nestjs, so a new column would never reach a DB-aware reviewer.
+function isSchemaFile(file: string): boolean {
   const lower = file.toLowerCase()
   return (
-    lower.includes(".controller.ts") ||
-    lower.includes(".resolver.ts") ||
-    lower.includes(".gateway.ts") ||
-    lower.includes(".service.ts") ||
-    lower.includes("/controllers/") ||
-    lower.includes("/controller/") ||
-    lower.includes("/routes/") ||
-    lower.includes("/route/") ||
-    lower.includes("/api/") ||
-    lower.includes("/handlers/") ||
-    lower.includes("/handler/") ||
-    lower.includes("/endpoints/") ||
-    lower.includes("/endpoint/") ||
-    lower.includes("/resolvers/") ||
-    lower.includes("/services/") ||
-    lower.includes("/service/") ||
-    lower.includes("openapi") ||
-    lower.includes("swagger")
+    lower.endsWith(".sql") ||
+    lower.endsWith(".entity.ts") ||
+    lower.endsWith(".model.ts") ||
+    lower.endsWith(".schema.ts") ||
+    lower.endsWith(".schema.prisma") ||
+    lower.endsWith(".dto.ts") ||
+    lower.includes("/entities/") ||
+    lower.includes("/models/") ||
+    lower.includes("/migration") ||
+    lower.includes("/migrations/") ||
+    lower.includes("/schema") ||
+    lower.includes("/schemas/") ||
+    lower.includes("prisma/schema") ||
+    lower.includes("drizzle") ||
+    lower.includes("typeorm") ||
+    lower.includes("sequelize") ||
+    lower.includes("knex")
   )
 }
 
@@ -481,11 +577,23 @@ function groupChangesByCategory(changes: Change[]): FileGroup[] {
     postgresql: { prompt: PROMPT_POSTGRESQL, agentName: "postgresql-reviewer" },
     caching: { prompt: PROMPT_CACHING, agentName: "caching-reviewer" },
     security: { prompt: PROMPT_SECURITY, agentName: "security-reviewer" },
-    // `design`, `functional`, and `curl` are never produced by categorizeFile —
-    // they are added as separate lenses in review(). Here for type completeness.
+    // `design`, `functional`, `curl`, and `schema` are never produced by
+    // categorizeFile — they are added as separate lenses in review(). Here for
+    // type completeness. `schema` reuses the database prompt but runs holistically
+    // over all column-bearing files so it can cross-check model ↔ migration.
     design: { prompt: PROMPT_DESIGN, agentName: "ui-design-reviewer" },
     functional: { prompt: PROMPT_FUNCTIONAL, agentName: "ui-functional-reviewer" },
     curl: { prompt: PROMPT_CURL, agentName: "api-curl-tester" },
+    schema: { prompt: PROMPT_DATABASE, agentName: "db-schema-reviewer" },
+    css: { prompt: PROMPT_CSS, agentName: "css-reviewer" },
+    typescript: { prompt: PROMPT_TYPESCRIPT, agentName: "typescript-reviewer" },
+    javascript: { prompt: PROMPT_JAVASCRIPT, agentName: "javascript-reviewer" },
+    python: { prompt: PROMPT_PYTHON, agentName: "python-reviewer" },
+    go: { prompt: PROMPT_GO, agentName: "go-reviewer" },
+    rust: { prompt: PROMPT_RUST, agentName: "rust-reviewer" },
+    java: { prompt: PROMPT_JAVA, agentName: "java-reviewer" },
+    html: { prompt: PROMPT_HTML, agentName: "html-reviewer" },
+    shell: { prompt: PROMPT_SHELL, agentName: "shell-reviewer" },
   }
 
   return [...groups.entries()]
@@ -497,6 +605,43 @@ function groupChangesByCategory(changes: Change[]): FileGroup[] {
     .filter((g) => g.changes.length > 0)
 }
 
+// Discover git repositories under `root` when the launch directory itself is
+// NOT a repo (e.g. a workspace folder that holds `backend/` and `frontend/`
+// repos side by side, or `code-claw/` holding `agent-claw/` + `cli-claw/`).
+// Bounded walk (depth ≤ 2, common heavy dirs skipped) so this turn's edits in a
+// nested repo are still reviewed instead of the whole panel skipping with
+// "not_enough_files". Returns each repo dir + its path prefix relative to `root`
+// so collected file paths stay meaningful for categorization.
+function findNestedRepos(root: string): Effect.Effect<{ dir: string; prefix: string }[]> {
+  return Effect.promise(async () => {
+    const SKIP = new Set(["node_modules", "dist", "build", ".next", ".turbo", "vendor", "coverage", "tmp"])
+    const MAX_DEPTH = 2
+    const found: { dir: string; prefix: string }[] = []
+    const walk = async (dir: string, prefix: string, depth: number): Promise<void> => {
+      if (depth > MAX_DEPTH) return
+      let names: { name: string; isDir: boolean }[]
+      try {
+        const entries = await fs.readdir(dir, { withFileTypes: true })
+        names = entries.map((e) => ({ name: e.name, isDir: e.isDirectory() }))
+      } catch {
+        return
+      }
+      // A directory containing `.git` is a repo root — record it and stop; do
+      // not descend into a repo's own subtree.
+      if (names.some((e) => e.name === ".git")) {
+        found.push({ dir, prefix })
+        return
+      }
+      for (const e of names) {
+        if (!e.isDir || e.name.startsWith(".") || SKIP.has(e.name)) continue
+        await walk(path.join(dir, e.name), prefix ? `${prefix}/${e.name}` : e.name, depth + 1)
+      }
+    }
+    await walk(root, "", 0)
+    return found
+  })
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -504,6 +649,7 @@ export const layer = Layer.effect(
     const git = yield* Git.Service
     const config = yield* Config.Service
     const snapshot = yield* Snapshot.Service
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
 
     // Run a single-shot reviewer/fixer LLM call, capturing the full text plus
     // token usage and wall-clock time for the audit log. Never fails — on
@@ -569,8 +715,15 @@ export const layer = Layer.effect(
       return { text, tokens, account, durationMs: Date.now() - started, error } satisfies StreamOutcome
     })
 
-    // Cap any single file's diff so one huge file can't crowd out the others.
+    // Cap any single file's DIFF (changed lines only) so one huge file can't
+    // crowd out the others.
     const MAX_FILE_DIFF = 15_000
+    // Cap for the change-LEDGER fallback, which carries a file's FULL current
+    // content (no baseline to diff against), not just changed lines. Must be far
+    // larger than MAX_FILE_DIFF: capping a whole single-file app at 15k made
+    // reviewers see only the top of the file and flag "missing script/handlers"
+    // for code that was actually further down — driving wasteful fix loops.
+    const MAX_LEDGER_CONTENT = 90_000
 
     // Context lines kept around each changed hunk in the review diff. The
     // snapshot's diffFull defaults to full-file context (needed for the TUI diff
@@ -581,57 +734,146 @@ export const layer = Layer.effect(
     // enclosing function without dumping the file.
     const REVIEW_DIFF_CONTEXT = 8
 
-    // Resolve the set of changes to review.
-    //   Preferred: diff the turn-start snapshot against the current tree, so
-    //   ONLY edits made during THIS user turn are reviewed (earlier uncommitted
-    //   work is in the baseline and excluded).
-    //   Fallback (snapshots disabled): whole working tree vs HEAD — not
-    //   turn-scoped, but keeps the feature working.
-    const collectChanges = Effect.fn("CodeReviewer.collectChanges")(function* (input: {
-      directory: string
-      baselineSnapshot?: string
-    }) {
-      if (input.baselineSnapshot) {
-        const current = yield* snapshot.track().pipe(Effect.catch(() => Effect.succeed(undefined)))
-        if (!current) return [] as Change[]
-        const diffs = yield* snapshot
-          .diffFull(input.baselineSnapshot, current, REVIEW_DIFF_CONTEXT)
-          .pipe(Effect.catch(() => Effect.succeed([] as Snapshot.FileDiff[])))
-        return diffs
-          .filter((d): d is Snapshot.FileDiff & { file: string } => Boolean(d.file) && d.status !== "deleted")
-          .map(
-            (d): Change => ({
-              file: d.file,
-              status: d.status === "added" ? "added" : "modified",
-              diff: (d.patch ?? "").slice(0, MAX_FILE_DIFF),
-            }),
-          )
-          .filter((c) => c.diff.trim().length > 0)
-      }
-
-      const hasHead = yield* git.hasHead(input.directory).pipe(Effect.catch(() => Effect.succeed(false)))
-      if (!hasHead) return [] as Change[]
-      const status = yield* git.status(input.directory).pipe(Effect.catch(() => Effect.succeed([] as Git.Item[])))
+    // Collect this turn's uncommitted changes from a SINGLE git repo. `prefix`
+    // is prepended to each file path (non-empty only when the launch directory
+    // holds nested repos) so paths stay meaningful for categorization + the
+    // reviewer prompts. Used by both the single-repo and nested-repo branches.
+    const collectFromRepo = Effect.fn("CodeReviewer.collectFromRepo")(function* (repoDir: string, prefix: string) {
+      const status = yield* git.status(repoDir).pipe(Effect.catch(() => Effect.succeed([] as Git.Item[])))
       const modified = status.filter((i) => i.status === "modified" || i.status === "added")
       const out: Change[] = []
       for (const item of modified) {
         // Untracked files (porcelain "??") are invisible to `git diff HEAD`.
         const source =
           item.code === "??"
-            ? git.patchUntracked(input.directory, item.file, { context: 3, maxOutputBytes: 100_000 })
-            : git.patch(input.directory, "HEAD", item.file, { context: 3, maxOutputBytes: 100_000 })
+            ? git.patchUntracked(repoDir, item.file, { context: 3, maxOutputBytes: 100_000 })
+            : git.patch(repoDir, "HEAD", item.file, { context: 3, maxOutputBytes: 100_000 })
         const patch = yield* source.pipe(
           Effect.catch(() => Effect.succeed({ text: "", truncated: false } as Git.Patch)),
         )
         if (patch.text.trim()) {
           out.push({
-            file: item.file,
+            file: prefix ? `${prefix}/${item.file}` : item.file,
             status: item.status === "added" ? "added" : "modified",
             diff: patch.text.slice(0, MAX_FILE_DIFF),
           })
         }
       }
       return out
+    })
+
+    // Resolve the set of changes to review.
+    //   Preferred: diff the turn-start snapshot against the current tree, so
+    //   ONLY edits made during THIS user turn are reviewed (earlier uncommitted
+    //   work is in the baseline and excluded).
+    //   Fallback (snapshots disabled): whole working tree vs HEAD — not
+    //   turn-scoped, but keeps the feature working.
+    // Change source of last resort: the per-session change ledger — the agent's
+    // OWN write/edit history, recorded by the processor independent of git and
+    // snapshots. This is what makes review work when git/snapshots can see
+    // nothing: a NON-git launch dir, or a file written OUTSIDE any repo (e.g.
+    // `spotify-v2.html` created directly in a parent workspace folder). We read
+    // the file's CURRENT content (there is no baseline to diff against off-git)
+    // and present it for review. Scoped to THIS turn via `baselineTime` so files
+    // edited in earlier turns aren't re-reviewed. `existingAbs` dedupes anything
+    // git/snapshots already returned.
+    const collectFromLedger = Effect.fn("CodeReviewer.collectFromLedger")(function* (input: {
+      directory: string
+      sessionID: SessionID
+      baselineTime?: number
+      base?: string
+      existingAbs: Set<string>
+    }) {
+      const manifest = yield* ChangeLedger.read(input.sessionID, input.base).pipe(
+        Effect.catch(() => Effect.succeed({} as ChangeLedger.Manifest)),
+      )
+      const out: Change[] = []
+      for (const entry of Object.values(manifest)) {
+        const abs = entry?.absFile
+        if (!abs || input.existingAbs.has(abs)) continue
+        if (input.baselineTime && entry.lastTime < input.baselineTime) continue
+        const content = yield* Effect.promise(() => fs.readFile(abs, "utf8").catch(() => ""))
+        if (!content.trim()) continue
+        // Full file content. Mark any truncation EXPLICITLY so the reviewer never
+        // assumes the file ends at the cut and flags missing tags/scripts/handlers
+        // that actually live below it.
+        const body =
+          content.length > MAX_LEDGER_CONTENT
+            ? content.slice(0, MAX_LEDGER_CONTENT) +
+              `\n\n[... TRUNCATED: showing the first ${MAX_LEDGER_CONTENT} of ${content.length} chars. The file CONTINUES below this point — do NOT report missing closing tags, scripts, handlers, imports, or exports as issues; they may simply be past the cut ...]`
+            : content
+        out.push({
+          file: path.relative(input.directory, abs) || abs,
+          status: entry.created ? "added" : "modified",
+          diff: body,
+        })
+      }
+      if (out.length > 0) {
+        log.info("code-reviewer.ledger-changes", { sessionID: input.sessionID, files: out.map((c) => c.file) })
+      }
+      return out
+    })
+
+    const collectChanges = Effect.fn("CodeReviewer.collectChanges")(function* (input: {
+      directory: string
+      sessionID: SessionID
+      baselineSnapshot?: string
+      baselineTime?: number
+      analysisBase?: string
+    }) {
+      let collected: Change[] = []
+      if (input.baselineSnapshot) {
+        const current = yield* snapshot.track().pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (current) {
+          const diffs = yield* snapshot
+            .diffFull(input.baselineSnapshot, current, REVIEW_DIFF_CONTEXT)
+            .pipe(Effect.catch(() => Effect.succeed([] as Snapshot.FileDiff[])))
+          collected = diffs
+            .filter((d): d is Snapshot.FileDiff & { file: string } => Boolean(d.file) && d.status !== "deleted")
+            .map(
+              (d): Change => ({
+                file: d.file,
+                status: d.status === "added" ? "added" : "modified",
+                diff: (d.patch ?? "").slice(0, MAX_FILE_DIFF),
+              }),
+            )
+            .filter((c) => c.diff.trim().length > 0)
+        }
+      } else {
+        const hasHead = yield* git.hasHead(input.directory).pipe(Effect.catch(() => Effect.succeed(false)))
+        if (hasHead) {
+          collected = yield* collectFromRepo(input.directory, "").pipe(Effect.catch(() => Effect.succeed([] as Change[])))
+        } else {
+          // Launch dir is NOT a git repo. It may hold nested repos (code-claw/ →
+          // agent-claw/ + cli-claw/) — aggregate those. Files in the parent
+          // itself are caught by the ledger fallback below.
+          const repos = yield* findNestedRepos(input.directory)
+          if (repos.length > 0) {
+            log.info("code-reviewer.nested-repos", {
+              directory: input.directory,
+              repos: repos.map((r) => r.prefix || "."),
+            })
+            for (const repo of repos) {
+              const changes = yield* collectFromRepo(repo.dir, repo.prefix).pipe(
+                Effect.catch(() => Effect.succeed([] as Change[])),
+              )
+              collected.push(...changes)
+            }
+          }
+        }
+      }
+
+      // Always augment with the ledger so writes git/snapshots missed (non-git
+      // launch dir, parent-folder files, ignored paths) are reviewed, not skipped.
+      const existingAbs = new Set(collected.map((c) => path.resolve(input.directory, c.file)))
+      const ledgerChanges = yield* collectFromLedger({
+        directory: input.directory,
+        sessionID: input.sessionID,
+        baselineTime: input.baselineTime,
+        base: input.analysisBase,
+        existingAbs,
+      })
+      return [...collected, ...ledgerChanges]
     })
 
     // Master decision-maker: a single fast call that looks at the user's
@@ -646,6 +888,7 @@ export const layer = Layer.effect(
       candidates: Category[]
       changes: Change[]
       userRequirement: string
+      changeManifest: string
       timeoutSeconds: number
     }) {
       const candidateList = input.candidates
@@ -665,6 +908,7 @@ export const layer = Layer.effect(
 
       const prompt = PROMPT_TRIAGE.replace("{candidates}", () => candidateList)
         .replace("{user_requirement}", () => input.userRequirement || "Review the changes for correctness")
+        .replace("{change_manifest}", () => input.changeManifest || "(no change ledger available)")
         .replace("{diff}", () => diff)
 
       const outcome = yield* streamReviewer({
@@ -703,6 +947,7 @@ export const layer = Layer.effect(
         parsed: Boolean(decision),
         need_review: decision?.need_review ?? null,
         candidates: input.candidates,
+        changeManifest: input.changeManifest || null,
         kept,
         reason: decision?.reason ?? null,
       })
@@ -743,7 +988,10 @@ export const layer = Layer.effect(
       // Batched code-expert calls get few files → large per-file budget;
       // holistic lenses (design/functional/curl) get many files → shallow but
       // complete coverage (every file at least present, never truncated away).
-      const PROMPT_DIFF_BUDGET = 48_000
+      // Budget is generous so a single-file app (ledger fallback carries the WHOLE
+      // file, ~64k for a real page) is reviewed in full rather than half-seen —
+      // a too-small budget made reviewers flag code that was merely past the cut.
+      const PROMPT_DIFF_BUDGET = 96_000
       const perFile = Math.max(1_200, Math.floor(PROMPT_DIFF_BUDGET / group.changes.length))
       const gitDiff = group.changes
         .map((c) => {
@@ -820,6 +1068,187 @@ export const layer = Layer.effect(
       })
 
       return { result, account: outcome.account }
+    })
+
+    // Separate, EXECUTING curl agent. Everything here runs inside the reviewer —
+    // the two LLM calls AND the test script execution — so NONE of it enters the
+    // main agent's context; only the final verdict flows back through the normal
+    // reviewer→fixer path. Three steps:
+    //   PLAN    — an LLM writes one self-contained bash test script (curl.txt).
+    //   EXECUTE — we run it with `bash --noprofile --norc -c` against the
+    //             already-rebuilt server (the user's project `run.sh --build`
+    //             ran post-triage, in `input.directory`), capturing stdout+stderr.
+    //   JUDGE   — an LLM reads the REAL captured output and returns the standard
+    //             {need_changes, feedback, refined_response} verdict (curl-judge.txt).
+    const CURL_EXEC_TIMEOUT_MS = 120_000
+    const CURL_OUTPUT_CAP = 24_000
+    // Hard ceiling for the optional rebuild via the user's project `run.sh
+    // --build`. Without this a hung `npm install` / stuck docker build freezes
+    // the entire reviewer panel indefinitely (the scope's finalizer would
+    // only fire on fiber interrupt, not on a stalled child). 5 min is a
+    // generous default for a normal rebuild and short enough to surface
+    // genuine hangs in a reasonable turn.
+    const RUN_SH_TIMEOUT_MS = 5 * 60_000
+    const runCurlTester = Effect.fn("CodeReviewer.runCurlTester")(function* (input: {
+      sessionID: SessionID
+      user: MessageV2.User
+      model: Provider.Model
+      group: FileGroup
+      userRequirement: string
+      timeoutSeconds: number
+      directory: string
+    }) {
+      const { group, userRequirement } = input
+      let account: Account = EMPTY_ACCOUNT
+
+      const fileList = group.changes.map((c) => c.file).join("\n")
+      const perFile = Math.max(1_200, Math.floor(96_000 / Math.max(1, group.changes.length)))
+      const gitDiff = group.changes
+        .map((c) => {
+          const body = c.diff.length > perFile ? c.diff.slice(0, perFile) + "\n… [diff truncated]" : c.diff
+          return `--- ${c.file} ---\n${body}\n`
+        })
+        .join("\n")
+
+      // ---- PLAN ----
+      const planPrompt = group.prompt
+        .replace("{files}", () => fileList)
+        .replace("{diff}", () => gitDiff)
+        .replace("{user_requirement}", () => userRequirement || "Test the changed API endpoints")
+        .replace("{curl_context}", () => group.context || "(CURL_TESTING.md does not exist yet — create it)")
+
+      const planOutcome = yield* streamReviewer({
+        agentName: "api-curl-tester",
+        system: "You are an API integration tester. Respond only with valid JSON.",
+        user: input.user,
+        model: input.model,
+        sessionID: input.sessionID,
+        small: true,
+        content: planPrompt,
+        timeoutSeconds: input.timeoutSeconds,
+      })
+      if (planOutcome.account) account = addAccount(account, planOutcome.account)
+
+      const plan = planOutcome.text.trim() ? (extractJsonObject(planOutcome.text) as Record<string, any> | null) : null
+      const runnable = plan?.runnable === true
+      const script = typeof plan?.script === "string" ? plan.script.trim() : ""
+      const planReason = typeof plan?.reason === "string" ? plan.reason : ""
+
+      yield* ReviewLog.append(input.sessionID, {
+        phase: "reviewer",
+        category: "curl",
+        agent: "api-curl-tester",
+        step: "plan",
+        model: `${input.model.providerID}/${input.model.id}`,
+        files: group.changes.map((c) => c.file),
+        durationMs: planOutcome.durationMs,
+        tokens: planOutcome.tokens,
+        inputChars: planPrompt.length,
+        input: planPrompt,
+        output: planOutcome.text,
+        error: planOutcome.error,
+        parsed: Boolean(plan),
+        runnable,
+        reason: planReason,
+      })
+
+      if (!runnable || !script) {
+        log.info("code-reviewer.curl-skip", { sessionID: input.sessionID, runnable, hasScript: Boolean(script), reason: planReason })
+        return { result: null as CodeReviewResult | null, account }
+      }
+
+      // ---- EXECUTE ----
+      const started = Date.now()
+      let execOut = ""
+      let execErr: string | undefined
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const handle = yield* spawner.spawn(
+            ChildProcess.make("bash", ["--noprofile", "--norc", "-c", script], {
+              cwd: input.directory,
+              extendEnv: true,
+              stdin: "ignore",
+            }),
+          )
+          const [stdout, stderr, code] = yield* Effect.all(
+            [
+              Stream.mkString(Stream.decodeText(handle.stdout)),
+              Stream.mkString(Stream.decodeText(handle.stderr)),
+              handle.exitCode,
+            ],
+            { concurrency: "unbounded" },
+          )
+          execOut = `[exit ${code}]\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`
+        }),
+      ).pipe(
+        Effect.timeout(Duration.millis(CURL_EXEC_TIMEOUT_MS)),
+        Effect.catch((err: unknown) =>
+          Effect.sync(() => {
+            execErr = String(err)
+          }),
+        ),
+      )
+      const execDurationMs = Date.now() - started
+      const capturedOutput = (execErr ? `[execution error/timeout: ${execErr}]\n${execOut}` : execOut).slice(
+        0,
+        CURL_OUTPUT_CAP,
+      )
+
+      yield* ReviewLog.append(input.sessionID, {
+        phase: "reviewer",
+        category: "curl",
+        agent: "api-curl-tester",
+        step: "execute",
+        durationMs: execDurationMs,
+        error: execErr,
+        scriptChars: script.length,
+        outputChars: capturedOutput.length,
+        output: capturedOutput,
+      })
+
+      // ---- JUDGE ----
+      const judgePrompt = PROMPT_CURL_JUDGE.replace("{plan_reason}", () => planReason)
+        .replace("{script}", () => script)
+        .replace("{output}", () => capturedOutput || "(no output captured)")
+        .replace("{diff}", () => gitDiff)
+        .replace("{user_requirement}", () => userRequirement || "Test the changed API endpoints")
+
+      const judgeOutcome = yield* streamReviewer({
+        agentName: "api-curl-judge",
+        system: "You are an API integration-test judge. Respond only with valid JSON.",
+        user: input.user,
+        model: input.model,
+        sessionID: input.sessionID,
+        small: true,
+        content: judgePrompt,
+        timeoutSeconds: input.timeoutSeconds,
+      })
+      if (judgeOutcome.account) account = addAccount(account, judgeOutcome.account)
+
+      const judged = judgeOutcome.text.trim() ? extractJsonObject(judgeOutcome.text) : null
+      let result: CodeReviewResult | null = null
+      if (judged && typeof judged === "object") {
+        result = Option.getOrNull(Schema.decodeUnknownOption(CodeReviewResult)(judged))
+      }
+
+      yield* ReviewLog.append(input.sessionID, {
+        phase: "reviewer",
+        category: "curl",
+        agent: "api-curl-judge",
+        step: "judge",
+        model: `${input.model.providerID}/${input.model.id}`,
+        durationMs: judgeOutcome.durationMs,
+        tokens: judgeOutcome.tokens,
+        inputChars: judgePrompt.length,
+        input: judgePrompt,
+        output: judgeOutcome.text,
+        error: judgeOutcome.error,
+        parsed: Boolean(result),
+        need_changes: result?.need_changes ?? null,
+        feedback: result?.feedback ?? null,
+      })
+
+      return { result, account }
     })
 
     const runFullStackFixer = Effect.fn("CodeReviewer.fullStackFixer")(function* (input: {
@@ -915,6 +1344,7 @@ export const layer = Layer.effect(
       model: Provider.Model
       userRequirement: string
       baselineSnapshot?: string
+      baselineTime?: number
     }) {
       const cfg = yield* config.get()
       const codeReviewerConfig = cfg.code_reviewer
@@ -928,6 +1358,7 @@ export const layer = Layer.effect(
       const designReview = codeReviewerConfig?.design_review ?? true
       const functionalReview = codeReviewerConfig?.functional_review ?? true
       const curlTesting = codeReviewerConfig?.curl_testing ?? true
+      const schemaReview = codeReviewerConfig?.schema_review ?? true
       // Master decision-maker gate: one fast call decides which specialists (if
       // any) apply to this turn's diff, so trivial edits skip review entirely
       // and only relevant reviewers run. Disable to always run the full panel.
@@ -968,7 +1399,10 @@ export const layer = Layer.effect(
 
       const changes = yield* collectChanges({
         directory: input.directory,
+        sessionID: input.sessionID,
         baselineSnapshot: input.baselineSnapshot,
+        baselineTime: input.baselineTime,
+        analysisBase: cfg.experimental?.api_analysis_dir,
       })
 
       log.info("code-reviewer.files", {
@@ -1030,29 +1464,64 @@ export const layer = Layer.effect(
         }
       }
 
-      // Extra curl/API-test lens over API files. Plans real curl tests for the
-      // main agent to run; reuses auth/base-URL from CURL_TESTING.md (injected
-      // here as {curl_context}) so repeat runs don't re-authenticate.
-      if (curlTesting) {
-        const apiChanges = changes.filter((c) => isAPIFile(c.file))
-        if (apiChanges.length > 0) {
-          const curlContext = yield* Effect.promise(() =>
-            fs
-              .readFile(path.join(input.directory, "CURL_TESTING.md"), "utf8")
-              .then((t) => t.slice(0, 8_000))
-              .catch(() => ""),
-          )
+      // Extra curl/API-test lens. Always a triage CANDIDATE (no isAPIFile path
+      // pre-filter) — the triage LLM decides whether THIS turn's diff actually
+      // warrants live API testing, so changes that break the API indirectly (a
+      // model/migration/service edit, not just a controller) still reach it.
+      // Plans real curl tests for the main agent to run; reuses auth/base-URL from
+      // CURL_TESTING.md (injected as {curl_context}) so repeat runs don't
+      // re-authenticate. The user's project server rebuild (`./run.sh --build`
+      // in `input.directory`) is DEFERRED until after triage keeps curl (see
+      // below), so non-API turns don't pay for it.
+      if (curlTesting && changes.length > 0) {
+        const curlContext = yield* Effect.promise(() =>
+          fs
+            .readFile(path.join(input.directory, "CURL_TESTING.md"), "utf8")
+            .then((t) => t.slice(0, 8_000))
+            .catch(() => ""),
+        )
+        groups.push({
+          category: "curl",
+          changes,
+          prompt: PROMPT_CURL,
+          agentName: "api-curl-tester",
+          context: curlContext,
+        })
+      }
+
+      // Extra holistic DB/schema lens over column-bearing files (entities,
+      // models, DTOs, schema, migrations). Sees them ALL together so it can
+      // verify every newly-added column is backed by a migration that creates
+      // it in the database — the per-file experts each see only their slice and
+      // route model/DTO files to general/nestjs, so this added-column ↔ migration
+      // cross-check would otherwise never happen.
+      if (schemaReview) {
+        const schemaChanges = changes.filter((c) => isSchemaFile(c.file))
+        if (schemaChanges.length > 0) {
           groups.push({
-            category: "curl",
-            changes: apiChanges,
-            prompt: PROMPT_CURL,
-            agentName: "api-curl-tester",
-            context: curlContext,
+            category: "schema",
+            changes: schemaChanges,
+            prompt: PROMPT_DATABASE,
+            agentName: "db-schema-reviewer",
           })
         }
       }
 
       const userRequirement = input.userRequirement?.trim() || "Multiple files modified - review for correctness"
+
+      // Out-of-context change manifest: a compact per-file summary of this turn's
+      // writes (`file: +A/-D over N edits — symbols`) the triage step routes from
+      // without re-reading the full diff. Keyed by ABSOLUTE path (resolve the
+      // snapshot's repo-relative file against the review directory) so it lines up
+      // with the ledger the processor wrote during the turn.
+      const useChangeLedger = codeReviewerConfig?.change_ledger ?? true
+      const changeManifest = useChangeLedger
+        ? yield* ChangeLedger.manifestText(
+            input.sessionID,
+            changes.map((c) => ({ abs: path.resolve(input.directory, c.file), rel: c.file })),
+            cfg.experimental?.api_analysis_dir,
+          )
+        : ""
 
       // Master decision-maker: prune the candidate reviewers down to the set
       // that actually applies to this diff — and skip review entirely for
@@ -1068,6 +1537,7 @@ export const layer = Layer.effect(
           candidates: groups.map((g) => g.category),
           changes,
           userRequirement,
+          changeManifest,
           timeoutSeconds: triageTimeout,
         }).pipe(
           Effect.catch((error: unknown) => {
@@ -1139,17 +1609,73 @@ export const layer = Layer.effect(
         return { result: null, usage: didCall ? usage : undefined }
       }
 
-      // Phase 1: Run all reviewer batches in parallel (capped to avoid rate limits)
+      // Curl lens survived triage → rebuild/restart the user's project server
+      // with this turn's changes by spawning THEIR `run.sh --build` (lives in
+      // the user's project root, NOT the nous repo's own launcher) before
+      // api-curl-tester plans tests, so it hits fresh code. Deferred to here
+      // (post-triage) so turns where triage drops curl never pay the build cost.
+      // Best-effort; failure just logs. The `Effect.timeout` here is the cap
+      // that turns a hung build into a clean skip — without it, a stuck
+      // `npm install` would freeze the whole panel (the spawner's scope
+      // finalizer only fires on fiber interrupt, not on a stalled child). On
+      // timeout, the scope finalizer kills the child (via the spawner's kill
+      // wiring on `handle`) and we log + continue.
+      if (batched.some((g) => g.category === "curl")) {
+        const userRunScriptPath = path.join(input.directory, "run.sh")
+        const hasUserRunSh = yield* Effect.promise(() =>
+          fs.access(userRunScriptPath).then(() => true).catch(() => false),
+        )
+        if (hasUserRunSh) {
+          log.info("code-reviewer.user-run-sh", { directory: input.directory })
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(
+                ChildProcess.make("./run.sh", ["--build"], {
+                  cwd: input.directory,
+                  extendEnv: true,
+                  stdin: "ignore",
+                  stdout: "inherit",
+                  stderr: "inherit",
+                }),
+              )
+              yield* handle.exitCode
+            }),
+          ).pipe(
+            Effect.timeout(Duration.millis(RUN_SH_TIMEOUT_MS)),
+            Effect.catch((err: unknown) =>
+              Effect.sync(() =>
+                log.warn("code-reviewer.user-run-sh-failed", { error: String(err) }),
+              ),
+            ),
+          )
+        }
+      }
+
+      // Phase 1: Run all reviewer batches in parallel (capped to avoid rate limits).
+      // The curl lens is special: it's the EXECUTING curl agent (plan→run→judge),
+      // not a single-shot reviewer — route it to runCurlTester. Everything it does
+      // stays inside the reviewer; only its verdict reaches the fixer/main agent.
       const reviewResults = yield* Effect.all(
         batched.map((group) =>
-          reviewCategory({
-            sessionID: input.sessionID,
-            user: input.user,
-            model: input.model,
-            group,
-            userRequirement,
-            timeoutSeconds: reviewerTimeout,
-          }).pipe(
+          (group.category === "curl"
+            ? runCurlTester({
+                sessionID: input.sessionID,
+                user: input.user,
+                model: input.model,
+                group,
+                userRequirement,
+                timeoutSeconds: reviewerTimeout,
+                directory: input.directory,
+              })
+            : reviewCategory({
+                sessionID: input.sessionID,
+                user: input.user,
+                model: input.model,
+                group,
+                userRequirement,
+                timeoutSeconds: reviewerTimeout,
+              })
+          ).pipe(
             Effect.catch((error: unknown) => {
               log.warn("code-reviewer.category-failed", {
                 error: String(error),
@@ -1261,6 +1787,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Config.defaultLayer),
   Layer.provide(Provider.defaultLayer),
   Layer.provide(LLM.defaultLayer),
+  Layer.provide(CrossSpawnSpawner.defaultLayer),
 )
 
 export * as CodeReviewer from "./code-reviewer"

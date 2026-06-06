@@ -284,6 +284,12 @@ export const Info = Schema.Struct({
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
       }),
+      auto_threshold: Schema.optional(
+        Schema.Number.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(1)),
+      ).annotate({
+        description:
+          "Fraction of the usable context budget at which auto-compaction triggers. 1.0 waits until full, lower values compact earlier (default: 0.7).",
+      }),
     }),
   ),
   reviewer: Schema.optional(
@@ -336,6 +342,10 @@ export const Info = Schema.Struct({
         description:
           "Run an extra curl/API-test reviewer on changed API files (default: true). Plans safe curl tests for the main agent to run, reusing auth/base-URL from a CURL_TESTING.md in the project root.",
       }),
+      schema_review: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra holistic database/schema reviewer over changed entity/model/DTO/migration/schema files (default: true). Sees all column-bearing files together and verifies every newly-added column is backed by a migration (else it will be missing in the DB at runtime).",
+      }),
       batch_size: Schema.optional(NonNegativeInt).annotate({
         description:
           "Max files per reviewer call (default: 6). Large categories are split into parallel batches so a single agent is never overwhelmed by 20+ files. 0 disables batching.",
@@ -349,6 +359,10 @@ export const Info = Schema.Struct({
       }),
       triage_timeout: Schema.optional(NonNegativeInt).annotate({
         description: "Triage decision-maker LLM timeout in seconds (default: 45).",
+      }),
+      change_ledger: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Maintain a per-session change ledger (out of the main agent's context) recording every write/edit as `file: +A/-D over N edits`. Fed to the triage decision-maker as a compact change manifest so it can route reviewers from a summary instead of the full diff (default: true).",
       }),
     }),
   ).annotate({ description: "Code reviewer configuration for reviewing file modifications" }),
@@ -367,6 +381,29 @@ export const Info = Schema.Struct({
       }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
+      }),
+      stale_read_invalidation: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "When the model reads a file and later writes/edits it in the same session, blank the now-stale read content in the LLM context (replaced with a 're-read for current content' marker) so the model never reasons against outdated file contents (default: true).",
+      }),
+      api_analysis_log: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Persist the full request + response JSON of every LLM call (main agent and reviewers) under <data>/analysis/<sessionID>/ as paired <seq>_<ts>_request.json / _response.json files, for later auditing of context effectiveness (default: true).",
+      }),
+      api_analysis_dir: Schema.optional(Schema.String).annotate({
+        description: "Override the base directory for api_analysis_log output (default: <data>/analysis).",
+      }),
+      llm_stall_timeout_ms: Schema.optional(Schema.Number).annotate({
+        description:
+          "Abort an in-flight LLM generation that emits no stream event (text/reasoning/tool) for this many milliseconds — catches frozen/degenerate generations that would otherwise hang for minutes. A model that is still streaming, however slowly, keeps resetting the timer and is never affected. 0 disables (default: 180000 = 3 min).",
+      }),
+      llm_max_duration_ms: Schema.optional(Schema.Number).annotate({
+        description:
+          "Optional hard ceiling: abort any single LLM generation whose total wall-clock exceeds this many milliseconds, even while still emitting events. Off by default because legitimate large file writes can stream for minutes. 0 disables (default: 0).",
+      }),
+      disable_thinking: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Globally disable extended thinking/reasoning for ALL LLM calls (main agent, fixer, and reviewers) by stripping every provider's thinking-enable flag (thinking, enable_thinking, reasoningEffort, thinkingConfig, …) from the request. This is exactly what small/reviewer calls already do (they omit the key and never emit reasoning), applied to the main agent's full-model calls too — cutting latency and runaway reasoning spirals. Set false to restore per-model thinking (default: true).",
       }),
     }),
   ),

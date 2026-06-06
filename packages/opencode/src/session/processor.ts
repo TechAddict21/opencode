@@ -10,6 +10,7 @@ import { Snapshot } from "@/snapshot"
 import * as Session from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
+import { ChangeLedger } from "./change-ledger"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
@@ -120,7 +121,8 @@ export const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
-      const reviewerEnabled = (yield* config.get()).reviewer?.enabled ?? true
+      const createCfg = yield* config.get()
+      const reviewerEnabled = createCfg.reviewer?.enabled ?? true
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 
       const parse = (e: unknown) =>
@@ -189,6 +191,30 @@ export const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
+        // Out-of-context change ledger: record every write/edit so the reviewer's
+        // triage step can route from a compact per-file summary (see ChangeLedger).
+        // Config is re-read here (not cached at session start) so a mid-session
+        // toggle of code_reviewer.change_ledger takes effect on the next tool
+        // call — same pattern the reviewer/codeReviewerEnabled gates use.
+        if (match.part.tool === "write" || match.part.tool === "edit") {
+          const liveCfg = yield* config.get()
+          if (liveCfg.code_reviewer?.change_ledger ?? true) {
+            const md = output.metadata ?? {}
+            const fp = typeof md["filepath"] === "string" ? (md["filepath"] as string) : undefined
+            if (fp) {
+              yield* ChangeLedger.record({
+                sessionID: ctx.sessionID,
+                absFile: fp,
+                tool: match.part.tool,
+                additions: typeof md["additions"] === "number" ? (md["additions"] as number) : 0,
+                deletions: typeof md["deletions"] === "number" ? (md["deletions"] as number) : 0,
+                created: md["exists"] === false,
+                diff: typeof md["diff"] === "string" ? (md["diff"] as string) : undefined,
+                base: liveCfg.experimental?.api_analysis_dir,
+              })
+            }
+          }
+        }
         yield* settleToolCall(toolCallID)
       })
 
@@ -785,7 +811,13 @@ export const layer = Layer.effect(
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
         ctx.needsCompaction = false
-        ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const procCfg = yield* config.get()
+        ctx.shouldBreak = procCfg.experimental?.continue_loop_on_deny !== true
+        // Stall guard: abort a generation that makes no progress. Default 3 min of
+        // total silence; the model degenerating into reasoning-with-no-output (as
+        // happened on large contexts) is killed instead of hanging for 8+ minutes.
+        const stallMs = procCfg.experimental?.llm_stall_timeout_ms ?? 180_000
+        const maxMs = procCfg.experimental?.llm_max_duration_ms ?? 0
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -794,11 +826,59 @@ export const layer = Layer.effect(
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+            let lastEventAt = Date.now()
+            const startedAt = lastEventAt
+            // Tools execute INLINE in the stream (the AI SDK calls each tool's
+            // execute() between its tool-call and tool-result events). A long bash /
+            // test / build is therefore a legitimate multi-minute gap with no stream
+            // events — NOT a model stall. Track in-flight tools so the watchdog
+            // ignores that window and only measures model-generation silence.
+            let toolsInFlight = 0
+            const drain = stream.pipe(
+              Stream.tap((event) => {
+                lastEventAt = Date.now()
+                if (event.type === "tool-call") toolsInFlight++
+                else if (event.type === "tool-result" || event.type === "tool-error")
+                  toolsInFlight = Math.max(0, toolsInFlight - 1)
+                return handleEvent(event)
+              }),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+
+            if (stallMs <= 0 && maxMs <= 0) {
+              yield* drain
+            } else {
+              // Watchdog runs as a sibling fiber via Effect.race. The stall check
+              // (no event for stallMs) only fires when the stream is genuinely
+              // frozen mid-generation — a model still emitting tokens keeps
+              // resetting lastEventAt, and an inline tool execution is excluded via
+              // toolsInFlight. maxMs is an optional hard ceiling (off by default).
+              // When the watchdog wins, race interrupts `drain`, which closes the
+              // llm.stream scope and fires ctrl.abort() — the same path as a user
+              // cancel — so the underlying HTTP request is actually torn down.
+              const watchdog = Effect.gen(function* () {
+                while (true) {
+                  yield* Effect.sleep("2 seconds")
+                  if (toolsInFlight > 0) continue
+                  const now = Date.now()
+                  if (stallMs > 0 && now - lastEventAt >= stallMs) return "stall" as const
+                  if (maxMs > 0 && now - startedAt >= maxMs) return "max_duration" as const
+                }
+              })
+              const outcome = yield* Effect.race(drain.pipe(Effect.as("ok" as const)), watchdog)
+              if (outcome !== "ok") {
+                aborted = true
+                const detail =
+                  outcome === "stall"
+                    ? `no output for ${Math.round(stallMs / 1000)}s`
+                    : `ran past ${Math.round(maxMs / 1000)}s`
+                slog.error("process", { stallGuard: outcome, detail })
+                if (!ctx.assistantMessage.error) {
+                  yield* halt(new DOMException(`Generation aborted by stall guard — ${detail}`, "AbortError"))
+                }
+              }
+            }
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {

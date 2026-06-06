@@ -24,3 +24,9 @@ No areas captured yet — the knowledge completer adds them as the codebase is e
 
 ## TUI Session
 - **TUI Session/TUI Session.md** — TUI route that renders the interactive chat session view with message list, user input, and message action dialogs.
+
+## Storage & Persistence
+- **Storage & Persistence/Storage & Persistence.md** — XDG-based directory layout, SQLite session DB, auth JSON persistence, log/session-diff cleanup
+
+## Code Reviewer
+- **Code Reviewer/Code Reviewer.md** — LLM-based code review system that reviews diffs and optionally executes `run.sh` before curl testing

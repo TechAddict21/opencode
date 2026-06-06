@@ -75,6 +75,57 @@ template.replace("{diff}", () => diff)          // safe
 template.replace("{diff}", diff)                // BUG: $-sequences mangled
 ```
 
+## Stall guard (processor `process`)
+
+The main agent loop (`processor.ts` `process`) wraps the stream drain in a stall
+guard so a degenerate generation — model emitting reasoning/no output, or a frozen
+stream on a huge context — cannot hang for minutes. Mechanism:
+
+- A `lastEventAt` timestamp is bumped in the drain's `Stream.tap` on every event.
+- A watchdog fiber races the drain (`Effect.race(drain.as("ok"), watchdog)`). When
+  no event arrives for `experimental.llm_stall_timeout_ms` (default 180 000), the
+  watchdog returns and **race interrupts the drain**, which closes the `llm.stream`
+  scope → fires the `acquireRelease` `ctrl.abort()` in `llm.ts` (same teardown as a
+  user cancel). The processor then calls `halt(AbortError)`, so the turn ends with
+  an error and the loop returns `"stop"` (no `Effect.retry` re-run of the stall).
+- **Inline-tool caveat:** AI SDK tools have `execute` fns (`session/tools.ts`), so a
+  tool runs *inside* the stream between its `tool-call` and `tool-result` events — a
+  long bash/test/build is a legitimate multi-minute gap. The guard tracks an
+  in-flight-tool counter and **skips the stall check while `toolsInFlight > 0`**, so
+  it only measures model-generation silence. Optional hard ceiling:
+  `experimental.llm_max_duration_ms` (0 = off).
+
+`interruptWhen` was rejected here: it ends the stream as a *graceful success* (no
+interrupt, no `onInterrupt`, no `finish` event), leaving a half-finished message.
+The race-then-explicit-`halt` path reproduces the exact user-cancel terminal state.
+
+## Global thinking kill-switch (`experimental.disable_thinking`, default ON)
+
+Reasoning/thinking is enabled per provider in `ProviderTransform.options()` (the
+**non-small** base), which injects keys like `thinking:{type:"enabled"}` for `k2p`
+on the anthropic SDK, `enable_thinking`/`chat_template_args` for kimi/dashscope,
+`reasoningEffort` for gpt-5, etc. `smallOptions()` omits all of these — which is
+exactly why `small:true` calls (triage + every reviewer + fixer) run `reason=0`
+and never think, while the main agent (`small:false`) does.
+
+`request.ts` `prepare()` strips every one of those keys from the merged `options`
+when `disableThinking` is set (threaded from `config.experimental.disable_thinking`
+at llm.ts, default `true`). Disabling thinking is just the **absence** of the key —
+no provider needs an explicit "off" (the reviewer path proves it: omit → no
+reasoning, no error). This makes the main agent behave like the reviewers and kills
+runaway reasoning (e.g. a 60K-char reasoning spiral that ate ~6 min on one turn).
+Set `disable_thinking: false` to restore per-model thinking.
+
+## Per-call analysis log
+
+Every `llm.stream` call (main agent *and* reviewer subagents) writes paired
+`<seq>_<ts>_request.json` / `_response.json` under `<data>/analysis/<sessionID>/`
+when `experimental.api_analysis_log` (default true). The request captures the
+assembled context (system + messages); the response captures outcome
+(`ok`/`interrupted`/`error`), finishReason, usage, text/reasoning lengths, event
+count, durationMs. This is the primary tool for diagnosing hangs — find the call
+with the largest `durationMs` and inspect its outcome/event counts.
+
 ## Key Files
 
 - `packages/llm/src/schema/events.ts` — `LLMEvent` (constructors + `is` guards) and `Usage`.

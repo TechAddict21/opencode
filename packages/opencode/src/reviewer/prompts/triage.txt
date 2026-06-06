@@ -40,6 +40,14 @@ Respond with a single JSON object and NOTHING ELSE:
 {user_requirement}
 ```
 
+## Change Manifest (compact per-file summary of this turn's edits)
+
+Use this to size the change at a glance — each line is `path: +added/-deleted over N edits — touched symbols`. Route from this first; consult the full diff below only to confirm what a reviewer would actually catch.
+
+```
+{change_manifest}
+```
+
 ## Changed Files + Diff
 
 ```

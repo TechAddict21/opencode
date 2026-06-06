@@ -1,7 +1,7 @@
 import { Provider } from "@/provider/provider"
 import { serviceUse } from "@/effect/service-use"
 import * as Log from "@nous-ai/core/util/log"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Exit, Cause } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@nous-ai/llm"
@@ -26,9 +26,47 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { AnalysisLog } from "./analysis-log"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+// Accumulator for the per-call analysis log (Feature: api_analysis_log). Folds
+// the LLMEvent stream into a compact response snapshot without consuming it for
+// the real consumer. Switch keys mirror the processor's event handling.
+interface CallAccumulator {
+  text: string
+  reasoning: string
+  toolCalls: Array<{ name: unknown; input: unknown }>
+  toolResults: number
+  finishReason?: string
+  usage?: unknown
+  events: number
+}
+
+function accumulateLLMEvent(acc: CallAccumulator, event: LLMEvent) {
+  acc.events++
+  const e = event as any
+  switch (e.type) {
+    case "text-delta":
+      acc.text += typeof e.text === "string" ? e.text : ""
+      break
+    case "reasoning-delta":
+      acc.reasoning += typeof e.text === "string" ? e.text : ""
+      break
+    case "tool-call":
+      acc.toolCalls.push({ name: e.name, input: e.input })
+      break
+    case "tool-result":
+      acc.toolResults++
+      break
+    case "step-finish":
+    case "finish":
+      if (e.reason) acc.finishReason = e.reason
+      if (e.usage) acc.usage = e.usage
+      break
+  }
+}
 
 export type StreamInput = {
   user: MessageV2.User
@@ -110,6 +148,7 @@ const live: Layer.Layer<
         plugin,
         flags,
         isWorkflow,
+        disableThinking: cfg.experimental?.disable_thinking ?? true,
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -349,18 +388,83 @@ const live: Layer.Layer<
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
 
+            // Per-call request/response logging. Capture the ASSEMBLED context
+            // (system + messages) we handed the model — the right unit for later
+            // auditing how effective our context handling is. `begin` writes the
+            // request once on acquisition; a scope finalizer writes the response
+            // exactly once on completion / error / interruption (the Exit tells
+            // us which). The tap folds events without consuming the stream.
+            const cfg = yield* config.get()
+            const analysisEnabled = cfg.experimental?.api_analysis_log ?? true
+            const analysisBase = cfg.experimental?.api_analysis_dir
+            const startedAt = Date.now()
+            const acc: CallAccumulator = { text: "", reasoning: "", toolCalls: [], toolResults: 0, events: 0 }
+            if (analysisEnabled) {
+              const seq = yield* AnalysisLog.begin({
+                sessionID: input.sessionID,
+                base: analysisBase,
+                request: {
+                  providerID: input.model.providerID,
+                  modelID: input.model.id,
+                  agent: input.agent.name,
+                  mode: input.agent.mode,
+                  small: input.small ?? false,
+                  toolChoice: input.toolChoice ?? "auto",
+                  retries: input.retries ?? 0,
+                  tools: Object.keys(input.tools),
+                  system: input.system,
+                  messages: input.messages,
+                },
+              })
+              yield* Effect.addFinalizer((exit) =>
+                AnalysisLog.complete({
+                  sessionID: input.sessionID,
+                  base: analysisBase,
+                  seq,
+                  response: {
+                    outcome: Exit.isSuccess(exit)
+                      ? "ok"
+                      : Cause.hasInterruptsOnly(exit.cause)
+                        ? "interrupted"
+                        : "error",
+                    finishReason: acc.finishReason ?? null,
+                    usage: acc.usage ?? null,
+                    text: acc.text,
+                    reasoning: acc.reasoning || undefined,
+                    toolCalls: acc.toolCalls,
+                    toolResultCount: acc.toolResults,
+                    eventCount: acc.events,
+                    durationMs: Date.now() - startedAt,
+                  },
+                }),
+              )
+            }
+
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native")
+              return result.stream.pipe(
+                Stream.tap((event) =>
+                  Effect.sync(() => {
+                    if (analysisEnabled) accumulateLLMEvent(acc, event)
+                  }),
+                ),
+              )
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
-            // already returns one; AI SDK streams are converted here.
+            // already returns one; AI SDK streams are converted here. Tap AFTER
+            // normalization so both runtimes feed the accumulator uniform events.
             const state = LLMAISDK.adapterState()
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.tap((event) =>
+                Effect.sync(() => {
+                  if (analysisEnabled) accumulateLLMEvent(acc, event)
+                }),
+              ),
             )
           }),
         ),

@@ -1273,6 +1273,9 @@ export const layer = Layer.effect(
         // turn, used to scope code review to only this turn's changes.
         let turnBaselineSnapshot: string | undefined
         let turnBaselineUserID: MessageID | null = null
+        // Wall-clock at the start of the genuine turn — turn-scopes the change
+        // ledger fallback when there is no git baseline (non-git launch dir).
+        let turnBaselineTime: number | undefined
         // Attribute reviewer/fixer token usage to the turn's assistant message as
         // a step-finish part, so it rolls into the session cumulative total (the
         // projector sums step-finish parts). Without this, reviewer tokens are
@@ -1327,7 +1330,8 @@ export const layer = Layer.effect(
           if (genuineUserID !== turnBaselineUserID) {
             turnBaselineUserID = genuineUserID
             turnBaselineSnapshot = yield* snapshot.track().pipe(Effect.catch(() => Effect.succeed(undefined)))
-            yield* slog.info("turn.baseline", { genuineUserID, snapshot: turnBaselineSnapshot })
+            turnBaselineTime = Date.now()
+            yield* slog.info("turn.baseline", { genuineUserID, snapshot: turnBaselineSnapshot, time: turnBaselineTime })
           }
 
           const lastAssistantMsg = msgs.findLast(
@@ -1357,7 +1361,7 @@ export const layer = Layer.effect(
             // Reviewer: check final response before presenting to user
             const cfg = yield* config.get()
             const reviewerConfig = cfg.reviewer
-            const reviewerEnabled = reviewerConfig?.enabled ?? true
+            const reviewerEnabled = !flags.disableReview && (reviewerConfig?.enabled ?? true)
             const reviewerMaxIterations = reviewerConfig?.max_iterations ?? 3
 
             yield* slog.info("reviewer.check", {
@@ -1534,7 +1538,7 @@ export const layer = Layer.effect(
 
             // Code Reviewer: check modified files before presenting to user
             const codeReviewerConfig = cfg.code_reviewer
-            const codeReviewerEnabled = codeReviewerConfig?.enabled ?? true
+            const codeReviewerEnabled = !flags.disableReview && (codeReviewerConfig?.enabled ?? true)
             const codeReviewerMaxIterations = codeReviewerConfig?.max_iterations ?? 2
             const directory = ctx.directory
 
@@ -1558,6 +1562,7 @@ export const layer = Layer.effect(
                 model: codeReviewModel,
                 userRequirement: genuineUserText,
                 baselineSnapshot: turnBaselineSnapshot,
+                baselineTime: turnBaselineTime,
               })
               yield* status.set(sessionID, { type: "busy" })
               yield* recordReviewUsage(lastAssistant.id, codeReviewUsage, "code-review")
@@ -1760,17 +1765,20 @@ export const layer = Layer.effect(
               .filter((p): p is MessageV2.TextPart => p.type === "text")
               .map((p) => p.text)
               .join("\n") ?? ""
-            if (userText.trim() && lastUserMsg) {
+            if (!flags.disableKnowledge && userText.trim() && lastUserMsg) {
               knowledgeContext = yield* knowledge
                 .feeder(userText, lastUserMsg.info.id, sessionID)
                 .pipe(Effect.catch(() => Effect.succeed(null)))
             }
 
+            const promptCfg = yield* config.get()
             const [skills, env, instructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(msgs, model, {
+                invalidateStaleReads: promptCfg.experimental?.stale_read_invalidation ?? true,
+              }),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             if (knowledgeContext) system.push(knowledgeContext)
@@ -1858,7 +1866,7 @@ export const layer = Layer.effect(
           msgsForCompleter.slice(lastUserMsgIndex + 1).some((msg) =>
             msg.parts.some((p) => p.type === "tool" && !p.metadata?.providerExecuted)
           )
-        if (turnHadToolCalls) {
+        if (turnHadToolCalls && !flags.disableKnowledge) {
           // Run knowledge completer to analyze the turn and update
           // the knowledge base (DRILL_DOWN_TREE.md and knowledge files).
           // Runs synchronously (not forked) so it completes before the response

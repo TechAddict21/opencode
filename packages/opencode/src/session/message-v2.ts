@@ -631,7 +631,7 @@ function providerMeta(metadata: Record<string, any> | undefined) {
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; invalidateStaleReads?: boolean },
 ) {
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
@@ -689,6 +689,35 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     }
 
     return { type: "json", value: output as never }
+  }
+
+  // Stale-read invalidation: a file `read` whose content is superseded by a
+  // LATER `write`/`edit` of the same file is outdated — showing its original
+  // output would make the model reason against stale content. Walk every part
+  // once (chronological order), record the last write sequence per absolute
+  // file, and flag any earlier read of a since-written file by its callID. The
+  // read's output is then blanked at the emit site (same mechanism as the
+  // `compacted` marker). Paths are compared as absolute (`metadata.filepath`,
+  // stamped by read/write/edit) to avoid relative-vs-absolute mismatches.
+  const staleReadCallIDs = new Set<string>()
+  if (options?.invalidateStaleReads) {
+    const lastWriteSeq = new Map<string, number>()
+    const reads: Array<{ callID: string; file: string; seq: number }> = []
+    let seq = 0
+    for (const msg of input) {
+      for (const part of msg.parts) {
+        seq++
+        if (part.type !== "tool" || part.state.status !== "completed") continue
+        const fp = part.state.metadata?.["filepath"]
+        if (typeof fp !== "string" || !fp) continue
+        if (part.tool === "write" || part.tool === "edit") lastWriteSeq.set(fp, seq)
+        else if (part.tool === "read") reads.push({ callID: part.callID, file: fp, seq })
+      }
+    }
+    for (const r of reads) {
+      const w = lastWriteSeq.get(r.file)
+      if (w !== undefined && w > r.seq) staleReadCallIDs.add(r.callID)
+    }
   }
 
   for (const msg of input) {
@@ -791,7 +820,9 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted
               ? "[Old tool result content cleared]"
-              : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+              : part.tool === "read" && staleReadCallIDs.has(part.callID)
+                ? `[Stale read: ${part.state.metadata?.["filepath"] ?? "this file"} was modified after this read — re-read for current content]`
+                : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
             // For providers that don't support media in tool results, extract media files
@@ -916,7 +947,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 export function toModelMessages(
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; invalidateStaleReads?: boolean },
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options).pipe(Effect.provide(EffectLogger.layer)))
 }

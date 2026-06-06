@@ -31,6 +31,7 @@ type PrepareInput = {
   readonly plugin: Plugin.Interface
   readonly flags: RuntimeFlags.Info
   readonly isWorkflow: boolean
+  readonly disableThinking?: boolean
 }
 
 export type Prepared = {
@@ -87,6 +88,37 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
         providerOptions: input.provider.options,
       })
   const options = mergeOptions(mergeOptions(mergeOptions(base, input.model.options), input.agent.options), variant)
+
+  // Global thinking/reasoning kill-switch (config.experimental.disable_thinking).
+  // Strip every provider's thinking-enable flag from the merged options so NO call
+  // (main agent, fixer, reviewers) emits extended reasoning. This mirrors what small
+  // calls already do via smallOptions() — which omits these keys, which is why
+  // reviewers run reason=0 and never error — now applied to full-model calls too.
+  // Disabling thinking is just the ABSENCE of these keys (no provider needs an
+  // explicit "off" here: anthropic/google/openai-compatible all default to no
+  // extended thinking when the flag is unset).
+  if (input.disableThinking) {
+    for (const k of [
+      "thinking",
+      "thinkingConfig",
+      "thinkingLevel",
+      "reasoning",
+      "reasoningEffort",
+      "reasoningSummary",
+      "enable_thinking",
+    ])
+      delete options[k]
+    const cta = options["chat_template_args"]
+    if (cta && typeof cta === "object") {
+      delete (cta as Record<string, any>)["enable_thinking"]
+      if (Object.keys(cta).length === 0) delete options["chat_template_args"]
+    }
+    if (Array.isArray(options["include"])) {
+      options["include"] = (options["include"] as any[]).filter((x) => x !== "reasoning.encrypted_content")
+      if (options["include"].length === 0) delete options["include"]
+    }
+  }
+
   if (isOpenaiOauth) options.instructions = system.join("\n")
 
   const messages =

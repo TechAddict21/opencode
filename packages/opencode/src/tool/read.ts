@@ -254,6 +254,7 @@ export const ReadTool = Tool.define(
             `</entries>`,
           ].join("\n"),
           metadata: {
+            filepath,
             preview: sliced.slice(0, 20).join("\n"),
             truncated,
             loaded: [] as string[],
@@ -274,6 +275,7 @@ export const ReadTool = Tool.define(
           title,
           output: msg,
           metadata: {
+            filepath,
             preview: msg,
             truncated: false,
             loaded: loaded.map((item) => item.filepath),
@@ -324,6 +326,7 @@ export const ReadTool = Tool.define(
         title,
         output,
         metadata: {
+          filepath,
           preview: file.raw.slice(0, 20).join("\n"),
           truncated,
           loaded: loaded.map((item) => item.filepath),
