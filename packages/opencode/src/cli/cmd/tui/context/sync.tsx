@@ -246,7 +246,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         }
 
         case "session.status": {
-          setStore("session_status", event.properties.sessionID, event.properties.status)
+          setStore("session_status", event.properties.sessionID, reconcile(event.properties.status))
           break
         }
 

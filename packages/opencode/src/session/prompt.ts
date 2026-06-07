@@ -1554,8 +1554,8 @@ export const layer = Layer.effect(
                 : yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
               // Surface "Reviewing" in the UI for the FILE reviewers only (not the
               // text reviewer above, which keeps the normal busy label).
-              yield* status.set(sessionID, { type: "busy", label: "reviewing" })
-              const { result: codeReviewResult, usage: codeReviewUsage } = yield* codeReviewer.review({
+            yield* status.set(sessionID, { type: "busy", label: "reviewing" })
+            const { result: codeReviewResult, usage: codeReviewUsage } = yield* codeReviewer.review({
                 sessionID,
                 directory,
                 user: lastUser,

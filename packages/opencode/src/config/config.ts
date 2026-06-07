@@ -364,6 +364,14 @@ export const Info = Schema.Struct({
         description:
           "Maintain a per-session change ledger (out of the main agent's context) recording every write/edit as `file: +A/-D over N edits`. Fed to the triage decision-maker as a compact change manifest so it can route reviewers from a summary instead of the full diff (default: true).",
       }),
+      side_effect_ledger: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Maintain a per-session side-effect ledger recording every non-file side-effect tool call (bash with docker/db/network/system/package-mutating commands) classified by kind. Fed to triage as a tool-call summary so turns whose work is purely runtime/infra state (e.g. `docker run`, `psql -c`, `kubectl apply`) still get reviewed even when no files changed (default: true).",
+      }),
+      infra_review: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra infra/runtime reviewer when the side-effect ledger shows mutating docker/db/network/system/package commands in this turn. Catches: secrets on the docker CLI instead of env files, unverified `docker run` (no `docker ps`/`exec` check), DB queries that don't assert results, ports exposed without auth, npm publish with no version bump, kubectl apply without `kubectl get` verification, etc. (default: true).",
+      }),
     }),
   ).annotate({ description: "Code reviewer configuration for reviewing file modifications" }),
   experimental: Schema.optional(

@@ -32,7 +32,12 @@ Both stages can loop (bounded), feeding work back to the main agent.
      the git fallback's `hasHead(code-claw)` was false → returned `[]` → `changedCount: 0` →
      `skip: not_enough_files`. The WHOLE panel (db, curl, frontend) was bypassed even though
      the turn edited real files. The nested-repo walk fixes this so reviewers fire regardless.
-2. If `changes.length <= max_files` → skip (logged).
+1b. `collectSideEffects` (sibling of `collectChanges`, see below) resolves the turn's non-file
+    side-effect tool calls from the side-effect ledger (`session/side-effect-ledger.ts`).
+    If `sideEffects.length > 0` AND `changes.length <= max_files`, the early-skip is BYPASSED
+    so the infra lens can still fire — a turn whose work is purely `docker run`/`psql -c`/etc.
+    has an empty file diff but still needs review.
+2. If `changes.length <= max_files` AND `sideEffects.length === 0` → skip (logged).
 3. `groupChangesByCategory` buckets files into categories via `categorizeFile`.
    Routing is **framework-path-first, then extension**: strong path rules win
    (nestjs, react_vite, caching, postgresql, frontend, database, config, security,
@@ -135,9 +140,11 @@ Both stages can loop (bounded), feeding work back to the main agent.
   - `functional_review` (default **true** → run the extra holistic UI functional-completeness reviewer)
   - `curl_testing` (default **true** → run the extra curl/API-test reviewer on API files)
   - `schema_review` (default **true** → run the extra holistic DB/schema reviewer over column-bearing files; verifies every new column is backed by a migration)
+  - `infra_review` (default **true** → run the extra runtime/infra reviewer when the side-effect ledger shows mutating docker/db/network/system/package commands in this turn; catches secrets on the CLI, unverified `docker run`, missing DB assertions, exposed ports, etc.)
   - `batch_size` (default **6** → max files per reviewer call; big categories split into parallel batches; 0 disables)
   - `concurrency` (default **4** → max reviewer batches running in parallel; lower if rate-limited)
   - `change_ledger` (default **true** → maintain the out-of-context per-session change manifest fed to triage; see below)
+  - `side_effect_ledger` (default **true** → maintain the out-of-context per-session side-effect ledger of non-file bash calls; fed to triage as a tool-call summary and used to gate the infra lens)
 - Experts always run on the small model (`small: true`). The fixer also runs on the small model
   by default (`fixer_small: true`) — the experts already did the analysis, so consolidation is cheap.
   **Lesson learned (real incident):** the session's main model is a *reasoning* model; running the
@@ -229,3 +236,67 @@ Three robustness features feed/surround review (all config-gated, default on, be
 - Experts still over-flag nitpicks despite the `need_changes` gate, but the fixer is the gate that
   matters — it filters nitpicks/contradictions/already-correct out of the final plan, so what
   reaches the main agent is clean. Don't expect experts to self-converge; expect the fixer to.
+
+## Side-effect ledger + `infra` lens (runtime state review)
+
+The default pipeline is file-diff based: it only knows about `write`/`edit` tool calls.
+A turn whose work is "create a docker container" or "run a migration" or "publish a package"
+produces no file edits, so the file pipeline sees `changedCount: 0` and skips review entirely
+(turn `ses_161e9f7e6ffer2MM2Zp3SYtXHO`: user asked to `docker run` a postgres container; the
+agent ran `docker run` + `docker exec psql` correctly, but the only file changes were
+`knowledge_base_world/{.gitignore,DRILL_DOWN_TREE.md,UNDERSTANDING.md}` — triage decided
+"trivial doc additions" and skipped review. The runtime work was unaudited).
+
+The side-effect ledger (`packages/opencode/src/session/side-effect-ledger.ts`) closes that
+gap. It is the runtime sibling of the change ledger:
+
+- `processor.completeToolCall` records every completed `bash`/`shell` call (command, description,
+  exit code, ~280 chars of output) to `<data>/analysis/<sessionID>/side-effects.json` (gated on
+  `code_reviewer.side_effect_ledger`, default true).
+- A cheap pattern-based classifier in `side-effect-ledger.classify` tags each command as
+  `docker:create` / `db:migrate` / `network:mutate` / `system:install` / `package:publish` / …
+  (`mutates: true`) or `read-only` (skipped). Conservative: unknown → `mutates: true`.
+- `collectSideEffects` is a sibling of `collectChanges` and returns this turn's
+  mutating infra-relevant calls time-scoped to the same `baselineTime` the file diff uses.
+- `SideEffectLedger.summaryText` renders a compact tool-call summary (`se_1 docker:create …`,
+  exit code, output preview) and feeds it to triage as a new `{tool_call_summary}` block.
+- The triage prompt now has a "non-file side effects" branch: if the user asked for infra work
+  (docker/db/kubectl/…) but the change manifest is empty, the `infra` candidate is the way to
+  find out whether the work was actually attempted and whether it succeeded → pick it.
+- The `infra` lens (`packages/opencode/src/reviewer/prompts/infra.txt`) reviews the COMMAND
+  itself, not a file diff. Catches:
+  - secrets on the CLI (`-e POSTGRES_PASSWORD=hunter2` in `docker run` — should be `_FILE` or env)
+  - unverified `docker run` (no `docker ps`/`docker exec`/log check after a `docker:create`)
+  - DB mutations without assertion (`psql -c "CREATE TABLE x ..."` with no `\d x` follow-up)
+  - ports exposed without auth (e.g. `0.0.0.0:5432:5432` for postgres with no password)
+  - data loss / irreversibility (`docker rm -f`, `DROP TABLE`, `kubectl delete`, `rm -rf`)
+    without a backup step
+  - persistence / restart (`docker run` without `--restart`, `systemctl start` without `enable`)
+  - container hardening (--privileged, --cap-add broad, --user root when unneeded)
+  - mismatch with the user requirement (user asked for `postgres:18`, agent used `postgres:18-alpine`;
+    user asked for port 9001, command maps a different port)
+
+### Lens wiring
+
+The `infra` lens reuses the existing `FileGroup` plumbing — it gets one virtual "file" per
+side-effect entry (`id` = `se_1`, `se_2`, …) and the diff is `formatInfraDiff`'s structured block
+(`kind`, `tool`, `exit`, `description`, `command`, `output-preview`). Same batching/concurrency
+as file reviews; only the prompt and routing are different. `reviewCategory` calls
+`buildPrompt(group)` with `PROMPT_INFRA`, and `{files}` / `{diff}` get the formatted blocks.
+
+### Opt-out
+
+Set `code_reviewer.side_effect_ledger: false` to disable recording (the ledger stops being
+written; triage falls back to file-diff only — back to the old behavior). Set
+`code_reviewer.infra_review: false` to keep recording but skip the `infra` lens while still
+letting the tool-call summary influence triage routing.
+
+### Gotcha
+
+The `infra` lens is the ONLY lens that runs on a turn whose work is purely runtime/infra state
+with no file changes. If you see triage skipping review for a `docker run`/`psql`/`kubectl apply`
+turn, check the review log for `sideEffectCount: 0` — that means the side-effect ledger didn't
+catch the bash call (e.g. the tool name isn't `bash`/`shell`, or the call hasn't completed yet
+by the time review fires — review reads the ledger asynchronously). Both should be rare; the
+bash tool is the only shell-like tool nous wires today, and review only fires AFTER the assistant
+turn completes, so all `completeToolCall` events have fired by then.

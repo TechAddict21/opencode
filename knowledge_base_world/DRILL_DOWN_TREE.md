@@ -29,4 +29,7 @@ No areas captured yet — the knowledge completer adds them as the codebase is e
 - **Storage & Persistence/Storage & Persistence.md** — XDG-based directory layout, SQLite session DB, auth JSON persistence, log/session-diff cleanup
 
 ## Code Reviewer
-- **Code Reviewer/Code Reviewer.md** — LLM-based code review system that reviews diffs and optionally executes `run.sh` before curl testing
+- **Code Reviewer/Code Reviewer.md** — Post-turn peer-review pipeline (triage → specialist reviewers with ledgers) that gates assistant responses before they reach the user.
+
+## Session Runner & Status
+- **Session Runner & Status/Session Runner & Status.md** — Session execution runner, status state machine, and TUI propagation of idle/busy/retry labels.

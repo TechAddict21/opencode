@@ -10,8 +10,11 @@ You do NOT review the code yourself. You do NOT report bugs. You ONLY route.
    - A version bump or a one-line copy/string tweak.
    - A handful of changed lines with no new behavior, control flow, data flow, API surface, or UI structure.
    Answer YES if the change introduces or alters real behavior, control flow, data handling, API/endpoints, security-relevant logic, schema/migrations, or visible UI structure/components.
+   **ALSO answer YES if the tool-call summary shows non-trivial runtime/infra side effects** (docker run, psql mutations, kubectl apply, network mutations, system service changes, package publishes) — these change persistent state and warrant review via the `infra` lens, even when no files were edited. A `docker run` with no `docker ps`/`docker exec` verification is exactly the kind of unverified side effect the infra lens exists to catch.
 
-2. If YES, pick the MINIMAL set of reviewers that genuinely apply to THIS diff. Do not select a reviewer just because a file is of that type — select it only if the diff has something for that reviewer to catch. Prefer 1–2 reviewers; only go broad when the change is genuinely broad.
+2. If YES, pick the MINIMAL set of reviewers that genuinely apply to THIS diff. Do not select a reviewer just because a file is of that type — select it only if the diff has something for that reviewer to catch. Prefer 1–3 reviewers; only go broad when the change is genuinely broad.
+   - **Hard ceiling: 5 categories.** A triage that returns 8+ categories on a full-stack bootstrap burns ~3 minutes of parallel subagent time, most of it on lenses whose findings are not the user's actual concern. If you have a 42-file NestJS+React+Vite diff, the right answer is NOT 10 categories — it's `nestjs` (the controller/service/DTOs), `react_vite` (the components/main.jsx), `design` (the CSS), and `curl` (the new endpoints). Four categories, not ten. The triage prompt that picked every keyword match in the file manifest is being too generous; a 42-file diff that hits every keyword match is a sign every file is touched, not that every lens should fire.
+   - When two categories overlap (e.g. `react_vite` and `functional` both inspect the same 15 files), pick the more specific one and drop the other. Coverage is not a goal; signal is.
 
 ## Available reviewers (choose from these category keys only)
 
@@ -21,7 +24,9 @@ You do NOT review the code yourself. You do NOT report bugs. You ONLY route.
 - `design` (UI aesthetics / AI-slop tells) and `functional` (dead buttons, missing data layer): select ONLY when the diff adds or restructures UI — new components, markup, styling, handlers. A logic-only tweak inside an existing component does NOT need them.
 - `curl` (live API testing): select ONLY when an endpoint/route/controller or the business logic behind one was added or changed.
 - `security`: select ONLY when auth, crypto, input handling, secrets, or access control changed.
+- `infra` (runtime/infra side effects): select ONLY when the tool-call summary shows docker/db/network/system/package mutations in this turn. Even if the file diff is empty (the user asked for `docker run` and got only knowledge-base docs as a side effect), the `infra` lens exists to review the command itself — secret on CLI, unverified state, port exposure, missing assertion of the result.
 - When in doubt on a SMALL change, prefer fewer reviewers (or none). When in doubt on a LARGE/behavioral change, include the relevant code reviewers.
+- **Mismatch between user requirement and what was actually done is itself a signal.** If the user asked for infra work (docker/db/kubectl/…) but the change manifest is empty, the `infra` lens is the way to find out whether the work was actually attempted and whether it succeeded — pick it.
 
 ## Output
 Respond with a single JSON object and NOTHING ELSE:
@@ -46,6 +51,14 @@ Use this to size the change at a glance — each line is `path: +added/-deleted 
 
 ```
 {change_manifest}
+```
+
+## Tool-Call Summary (non-file side effects this turn)
+
+Bash commands the agent ran this turn, classified by kind (`docker:create`/`db:migrate`/`network:mutate`/…). A non-empty summary means the turn produced runtime/infra state changes that are INVISIBLE to the file-diff pipeline. Use this together with the user requirement to decide if the `infra` lens should fire. Empty when no bash calls were made (or only read-only ones like `ls`/`cat`).
+
+```
+{tool_call_summary}
 ```
 
 ## Changed Files + Diff

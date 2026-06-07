@@ -7,6 +7,7 @@ import { serviceUse } from "@/effect/service-use"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionID } from "@/session/schema"
 import { ChangeLedger } from "@/session/change-ledger"
+import { SideEffectLedger } from "@/session/side-effect-ledger"
 import * as Log from "@nous-ai/core/util/log"
 import * as Stream from "effect/Stream"
 import { Effect, Layer, Context, Schema, Option, Duration } from "effect"
@@ -43,6 +44,7 @@ import PROMPT_RUST from "./prompts/rust.txt"
 import PROMPT_JAVA from "./prompts/java.txt"
 import PROMPT_HTML from "./prompts/html.txt"
 import PROMPT_SHELL from "./prompts/shell.txt"
+import PROMPT_INFRA from "./prompts/infra.txt"
 import { extractJsonObject } from "./util"
 
 const log = Log.create({ service: "code-reviewer" })
@@ -70,6 +72,13 @@ type Category =
   | "functional"
   | "curl"
   | "schema"
+  // Runtime/infra side-effect lens: a turn whose work is purely runtime/infra
+  // state — `docker run`, `psql -c`, `kubectl apply`, `npm publish`, etc. —
+  // produces no file diff, so the file-only pipeline would skip it. The
+  // side-effect ledger (`session/side-effect-ledger.ts`) feeds `collectSideEffects`
+  // the bash calls; `isInfraChange` filters them; the `infra` lens (see
+  // `prompts/infra.txt`) reviews them.
+  | "infra"
   // Language/extension lenses: a file that matches no framework/path rule is
   | "css"
   | "typescript"
@@ -98,6 +107,7 @@ const CATEGORY_DESCRIPTIONS: Record<Category, string> = {
   functional: "UI functional completeness: dead controls, missing data layer, no-op handlers",
   curl: "Live API testing via curl for new/changed endpoints & business logic",
   schema: "Holistic DB/schema integrity: every new entity/model/DTO column must be backed by a migration",
+  infra: "Runtime/infra side effects: docker run/exec/stop, psql/mysql/mongo mutations, kubectl apply, network mutations/exposed ports, system service changes, package publishes — verify the command actually succeeded, secrets aren't on the CLI, ports are intentional, and the result is asserted",
   css: "CSS/SCSS/Sass/Less: specificity, layout, responsive/overflow, tokens, dead/duplicate rules",
   typescript: "Generic TypeScript (no framework match): types, async/await, error handling, null-safety, exhaustiveness",
   javascript: "Generic JavaScript (no framework match): correctness, async, equality/coercion, mutation, error handling",
@@ -122,6 +132,18 @@ interface Change {
   status: "added" | "modified"
   diff: string
 }
+
+// A single non-file side-effect tool call for THIS turn (e.g. `docker run`,
+// `psql -c "..."`, `kubectl apply ...`). The side-effect ledger
+// (`session/side-effect-ledger.ts`) records every completed bash call with
+// its command, kind, and a small output preview; `collectSideEffects` scopes
+// it to the current turn (by `time >= baselineTime`) and returns the list
+// the `infra` lens reviews. This is the runtime/infra sibling of `Change`.
+//
+// Aliased to `SideEffectLedger.Entry` (not duplicated as a local interface) so
+// any new field on `Entry` is automatically picked up here — a rebuilder like
+// `entry => ({ id, tool, … })` would silently drop new fields and drift.
+type SideEffect = SideEffectLedger.Entry
 
 interface TokenSummary {
   input?: number
@@ -527,6 +549,134 @@ function isUIFile(file: string): boolean {
   )
 }
 
+// A non-file side-effect tool call counts as "infra work" for the `infra`
+// lens when it mutates persistent runtime state. The classifier in
+// `side-effect-ledger.ts` already separates mutating vs read-only kinds; this
+// helper is the cheap second pass that says "is this an INFRA category"
+// (docker/db/network/system/package vs. e.g. `vcs:mutate` or `package:exec`
+// which the general review flow can already catch via file diffs). vcs/pacakge-
+// exec kinds are deliberately NOT routed to the infra lens — those produce
+// local repo changes the existing file pipeline can review.
+function isInfraChange(s: SideEffect): boolean {
+  if (!s.mutates) return false
+  return (
+    s.kind.startsWith("docker:") ||
+    s.kind.startsWith("db:") ||
+    s.kind === "network:mutate" ||
+    s.kind === "network:expose" ||
+    s.kind === "system:mutate" ||
+    s.kind === "system:install" ||
+    s.kind === "package:publish"
+  )
+}
+
+// True when the file path looks like it could affect the externally-
+// observable API surface (server-side endpoint, route, middleware, request
+// handler, model, schema, migration, env file with API URLs/tokens, or any
+// *.api.* file). Used to scope the `curl` group so the tester doesn't have to
+// wade through every CSS/component file in a full-stack diff. Heuristic only
+// — when in doubt the caller falls back to the full set.
+function isAPIFile(path: string): boolean {
+  const p = path.toLowerCase()
+  // Env files: the curl tester needs to know base URLs / tokens / DB names,
+  // and the script it writes will source them. Match `.env`, `.env.example`,
+  // `.env.<name>`, `.env.<name>.example`, and `<name>.env` / `<name>.env.example`
+  // (dotenv loads all `.<name>.env*` files). The `.pg.env` convention used in
+  // this very session is the `<name>.env` case.
+  if (
+    p === ".env" ||
+    p === ".env.example" ||
+    p.endsWith(".env") ||
+    p.endsWith(".env.example") ||
+    /\.env\.[a-z0-9_]+$/.test(p) ||
+    /\.env\.[a-z0-9_]+\.example$/.test(p)
+  ) return true
+  // Common server-side naming conventions. Matched as substrings so paths
+  // like `backend/src/todos/todos.controller.ts` and `api/routes/orders.ts`
+  // both register.
+  if (
+    p.includes("controller") ||
+    p.includes("route") ||
+    p.includes("middleware") ||
+    p.includes("handler") ||
+    p.includes("endpoint") ||
+    p.includes("server") ||
+    p.includes("backend/") ||
+    p.includes("services/") ||
+    p.includes("api/") ||
+    p.includes(".api.") ||
+    p.includes("dto") ||
+    p.includes("model") ||
+    p.includes("schema") ||
+    p.includes("migration") ||
+    p.includes("seed") ||
+    p.includes("resolvers") ||
+    p.includes("trpc")
+  ) return true
+  // Strip known non-API extensions. Any file with a client-only or asset
+  // extension is never the curl tester's concern.
+  if (
+    p.endsWith(".css") ||
+    p.endsWith(".scss") ||
+    p.endsWith(".sass") ||
+    p.endsWith(".less") ||
+    p.endsWith(".html") ||
+    p.endsWith(".svg") ||
+    p.endsWith(".png") ||
+    p.endsWith(".jpg") ||
+    p.endsWith(".gif") ||
+    p.endsWith(".ico") ||
+    p.endsWith(".jsx") ||
+    p.endsWith(".tsx") ||
+    p.endsWith(".vue") ||
+    p.endsWith(".svelte") ||
+    p.endsWith(".md") ||
+    p.endsWith(".mdx") ||
+    p.endsWith(".txt")
+  ) return false
+  return false
+}
+
+// Render one side-effect entry as a fake "diff" string the infra-reviewer
+// prompt can ingest. The real review here is on the COMMAND, not on a file,
+// so the formatted block makes the command + kind + output the first-class
+// fields the prompt reasons over. We keep the {file} slot populated with the
+// side-effect id (e.g. `se_3`) so the lens can refer to it.
+function formatInfraDiff(s: SideEffect): string {
+  const lines: string[] = []
+  lines.push(`@@ side-effect ${s.id} @@`)
+  lines.push(`kind: ${s.kind}`)
+  lines.push(`tool: ${s.tool}`)
+  if (typeof s.exit === "number") lines.push(`exit: ${s.exit === 0 ? "0 (ok)" : `${s.exit} (FAILED)`}`)
+  if (s.description) lines.push(`description: ${s.description}`)
+  lines.push("command:")
+  for (const ln of s.fullCommand.split("\n")) lines.push(`  ${ln}`)
+  if (s.outputPreview) {
+    lines.push("output-preview:")
+    for (const ln of s.outputPreview.split("\n")) lines.push(`  ${ln}`)
+  }
+  return lines.join("\n")
+}
+
+// Read the side-effect ledger and return this turn's mutating infra-relevant
+// bash calls (e.g. `docker run`, `psql -c "..."`, `kubectl apply`). Time-
+// scoped to `baselineTime` (the turn's snapshot time) so earlier turns in the
+// same session don't bleed in. Returns [] when the ledger is empty or the
+// `side_effect_ledger` config gate is off. Used as a sibling of `collectChanges`
+// for the file pipeline — the only signal that catches turns whose work is
+// purely runtime/infra state.
+function collectSideEffects(
+  sessionID: SessionID,
+  baselineTime?: number,
+  base?: string,
+): Effect.Effect<SideEffect[]> {
+  return Effect.gen(function* () {
+    const all = yield* SideEffectLedger.read(sessionID, base)
+    const inTurn = baselineTime ? all.filter((e) => e.time >= baselineTime) : all
+    return inTurn.filter(isInfraChange)
+  })
+}
+
 // Files that can introduce or alter a PERSISTED column/field — entities, ORM
 // models, schema definitions, migrations, and the DTOs that mirror them. These
 // get an extra holistic schema lens so a column added to a model/DTO is always
@@ -585,6 +735,7 @@ function groupChangesByCategory(changes: Change[]): FileGroup[] {
     functional: { prompt: PROMPT_FUNCTIONAL, agentName: "ui-functional-reviewer" },
     curl: { prompt: PROMPT_CURL, agentName: "api-curl-tester" },
     schema: { prompt: PROMPT_DATABASE, agentName: "db-schema-reviewer" },
+    infra: { prompt: PROMPT_INFRA, agentName: "infra-reviewer" },
     css: { prompt: PROMPT_CSS, agentName: "css-reviewer" },
     typescript: { prompt: PROMPT_TYPESCRIPT, agentName: "typescript-reviewer" },
     javascript: { prompt: PROMPT_JAVASCRIPT, agentName: "javascript-reviewer" },
@@ -724,6 +875,17 @@ export const layer = Layer.effect(
     // reviewers see only the top of the file and flag "missing script/handlers"
     // for code that was actually further down — driving wasteful fix loops.
     const MAX_LEDGER_CONTENT = 90_000
+    // Per-file ceiling fed to a LENS prompt. Stacks on top of MAX_FILE_DIFF /
+    // MAX_LEDGER_CONTENT (which are upstream caps on what the file diff
+    // collector can return). The lens prompt budget is shared across files
+    // (96k / count), but a single 30k+ file at 6-per-batch still produces a
+    // 96k prompt that the model is too slow to finish before its first-chunk
+    // timeout fires. Capping the per-file lens slice at 8k keeps a 6-file
+    // batch under 48k of text — fast enough to respond well under the typical
+    // 25-30s SSE first-chunk budget. The MAX_FILE_DIFF / MAX_LEDGER_CONTENT
+    // upstream caps already give the model all the changed content; this is
+    // the LENS prompt's own budget on top.
+    const MAX_LENS_FILE = 8_000
 
     // Context lines kept around each changed hunk in the review diff. The
     // snapshot's diffFull defaults to full-file context (needed for the TUI diff
@@ -889,6 +1051,7 @@ export const layer = Layer.effect(
       changes: Change[]
       userRequirement: string
       changeManifest: string
+      toolCallSummary: string
       timeoutSeconds: number
     }) {
       const candidateList = input.candidates
@@ -898,7 +1061,14 @@ export const layer = Layer.effect(
       // Keep the triage diff compact — it only needs to recognize the SHAPE of
       // the change, not review it line by line.
       const TRIAGE_DIFF_BUDGET = 24_000
-      const perFile = Math.max(600, Math.floor(TRIAGE_DIFF_BUDGET / Math.max(1, input.changes.length)))
+      // Cap the diff budget so a long tool-call summary doesn't push file diffs
+      // out of the prompt. Side effects aren't review-by-line; the summary is
+      // already compact.
+      const FILE_DIFF_BUDGET = 20_000
+      const perFile = Math.max(
+        600,
+        Math.floor(FILE_DIFF_BUDGET / Math.max(1, input.changes.length)),
+      )
       const diff = input.changes
         .map((c) => {
           const body = c.diff.length > perFile ? c.diff.slice(0, perFile) + "\n… [diff truncated]" : c.diff
@@ -909,6 +1079,7 @@ export const layer = Layer.effect(
       const prompt = PROMPT_TRIAGE.replace("{candidates}", () => candidateList)
         .replace("{user_requirement}", () => input.userRequirement || "Review the changes for correctness")
         .replace("{change_manifest}", () => input.changeManifest || "(no change ledger available)")
+        .replace("{tool_call_summary}", () => input.toolCallSummary || "(no side-effect tool calls recorded this turn)")
         .replace("{diff}", () => diff)
 
       const outcome = yield* streamReviewer({
@@ -991,8 +1162,13 @@ export const layer = Layer.effect(
       // Budget is generous so a single-file app (ledger fallback carries the WHOLE
       // file, ~64k for a real page) is reviewed in full rather than half-seen —
       // a too-small budget made reviewers flag code that was merely past the cut.
+      // Capped per-file by MAX_LENS_FILE: a 6-file batch at the perFile = 16k
+      // ceiling produced 96k of input that the model couldn't finish before its
+      // first-chunk timeout fired (7 timeouts in one turn at 25-30s each ≈ 3 min
+      // wasted). MAX_LENS_FILE is the per-file ceiling; the total prompt stays
+      // bounded by `perFile * group.changes.length`.
       const PROMPT_DIFF_BUDGET = 96_000
-      const perFile = Math.max(1_200, Math.floor(PROMPT_DIFF_BUDGET / group.changes.length))
+      const perFile = Math.max(1_200, Math.min(MAX_LENS_FILE, Math.floor(PROMPT_DIFF_BUDGET / group.changes.length)))
       const gitDiff = group.changes
         .map((c) => {
           const body = c.diff.length > perFile ? c.diff.slice(0, perFile) + "\n… [diff truncated]" : c.diff
@@ -1102,7 +1278,11 @@ export const layer = Layer.effect(
       let account: Account = EMPTY_ACCOUNT
 
       const fileList = group.changes.map((c) => c.file).join("\n")
-      const perFile = Math.max(1_200, Math.floor(96_000 / Math.max(1, group.changes.length)))
+      // Per-file lens ceiling (see MAX_LENS_FILE for rationale). The curl tester
+      // historically received all changed files for the diff's project — 42
+      // files on a 42-file bootstrap, ~96k of input — and timeouts ran 25-30s
+      // each. Same fix as the file-reviewer cap: min(perFile, MAX_LENS_FILE).
+      const perFile = Math.max(1_200, Math.min(MAX_LENS_FILE, Math.floor(96_000 / Math.max(1, group.changes.length))))
       const gitDiff = group.changes
         .map((c) => {
           const body = c.diff.length > perFile ? c.diff.slice(0, perFile) + "\n… [diff truncated]" : c.diff
@@ -1405,19 +1585,38 @@ export const layer = Layer.effect(
         analysisBase: cfg.experimental?.api_analysis_dir,
       })
 
+      // Sibling of collectChanges for runtime/infra state: reads the side-effect
+      // ledger and returns this turn's mutating docker/db/network/system/package
+      // bash calls. Time-scoped to baselineTime (same as file diff). Empty when
+      // the turn didn't run such commands, or when the side_effect_ledger gate
+      // is off. This is the only signal that catches turns whose work is purely
+      // runtime state — e.g. "create this docker container" produces no file
+      // diff, so the file pipeline would otherwise skip the review entirely.
+      const infraReviewEnabled = codeReviewerConfig?.infra_review ?? true
+      const sideEffects: SideEffect[] = infraReviewEnabled
+        ? yield* collectSideEffects(input.sessionID, input.baselineTime, cfg.experimental?.api_analysis_dir)
+        : []
+
       log.info("code-reviewer.files", {
         sessionID: input.sessionID,
         changedCount: changes.length,
         files: changes.map((c) => c.file),
+        sideEffectCount: sideEffects.length,
       })
 
       yield* ReviewLog.append(input.sessionID, {
         phase: "changes",
         changedCount: changes.length,
         files: changes.map((c) => ({ file: c.file, status: c.status, diffChars: c.diff.length })),
+        sideEffectCount: sideEffects.length,
       })
 
-      if (changes.length <= maxFiles) {
+      // Early-skip guard (file-pipeline). Bypassed when the turn has runtime
+      // side effects — a docker run with no file changes still needs review
+      // via the infra lens, otherwise a turn whose entire work is a `docker
+      // run` (no file edits) is silently unaudited. The `infra` lens is
+      // added below and triage decides whether to keep it.
+      if (changes.length <= maxFiles && sideEffects.length === 0) {
         log.info("code-reviewer.skipping", {
           sessionID: input.sessionID,
           reason: "not_enough_files",
@@ -1435,6 +1634,28 @@ export const layer = Layer.effect(
       }
 
       const groups = groupChangesByCategory(changes)
+
+      // Infra lens: when the turn has mutating docker/db/network/system/package
+      // bash calls (and infra_review is on), add an `infra` group. The lens
+      // gets the full side-effect list (NOT a synthetic Change — there's no
+      // file) and a dedicated prompt. We piggyback on FileGroup.changes for
+      // plumbing but populate each entry with the side-effect's command, kind,
+      // and outputPreview so the existing `reviewCategory`/batch plumbing works
+      // unchanged. One "virtual file" per side effect — enough to ride the
+      // existing batching/concurrency; the prompt is what makes the lens see
+      // them as commands, not files (see `prompts/infra.txt`).
+      if (infraReviewEnabled && sideEffects.length > 0) {
+        groups.push({
+          category: "infra",
+          changes: sideEffects.map((s) => ({
+            file: s.id,
+            status: "added" as const,
+            diff: formatInfraDiff(s),
+          })),
+          prompt: PROMPT_INFRA,
+          agentName: "infra-reviewer",
+        })
+      }
 
       // Extra UI/UX design lens over UI files, in addition to their code category.
       if (designReview) {
@@ -1480,9 +1701,20 @@ export const layer = Layer.effect(
             .then((t) => t.slice(0, 8_000))
             .catch(() => ""),
         )
+        // The curl tester plans a bash script for the CHANGED API surface. It
+        // does not need CSS, components, or other non-server files. Filtering
+        // here avoids a 42-file 96k-prompt curl(42) on a 42-file bootstrap —
+        // each of those files consumed per-file budget the tester would have
+        // spent on actual endpoints. Fall back to the full `changes` set when
+        // the filter yields nothing (triage already kept the category, so the
+        // triage LLM has signalled there IS API surface worth testing; in that
+        // case the heuristics below missed it and we hand the tester whatever
+        // we have).
+        const apiChanges = changes.filter((c) => isAPIFile(c.file))
+        const curlChanges = apiChanges.length > 0 ? apiChanges : changes
         groups.push({
           category: "curl",
-          changes,
+          changes: curlChanges,
           prompt: PROMPT_CURL,
           agentName: "api-curl-tester",
           context: curlContext,
@@ -1523,6 +1755,24 @@ export const layer = Layer.effect(
           )
         : ""
 
+      // Tool-call summary for triage. Reads the side-effect ledger (the
+      // runtime/infra sibling of the change manifest) and renders a compact
+      // list of the turn's mutating bash calls (docker run, psql -c, kubectl
+      // apply, …). Triage uses it to decide whether this turn is reviewable
+      // even when the file diff is empty — e.g. the user's request was a
+      // `docker run` with no code edits, so the file pipeline would otherwise
+      // skip review entirely. The `infra` candidate is force-included below
+      // when this is non-empty.
+      const toolCallSummary = yield* SideEffectLedger.summaryText(
+        input.sessionID,
+        {
+          maxMutations: 20,
+          includeReadOnly: false,
+          base: cfg.experimental?.api_analysis_dir,
+          baselineTime: input.baselineTime,
+        },
+      )
+
       // Master decision-maker: prune the candidate reviewers down to the set
       // that actually applies to this diff — and skip review entirely for
       // trivial changes (null guards, typos, renames). Runs once, before the
@@ -1538,6 +1788,7 @@ export const layer = Layer.effect(
           changes,
           userRequirement,
           changeManifest,
+          toolCallSummary,
           timeoutSeconds: triageTimeout,
         }).pipe(
           Effect.catch((error: unknown) => {

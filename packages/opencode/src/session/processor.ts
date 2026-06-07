@@ -11,6 +11,7 @@ import * as Session from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { ChangeLedger } from "./change-ledger"
+import { SideEffectLedger } from "./side-effect-ledger"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
@@ -211,6 +212,43 @@ export const layer = Layer.effect(
                 created: md["exists"] === false,
                 diff: typeof md["diff"] === "string" ? (md["diff"] as string) : undefined,
                 base: liveCfg.experimental?.api_analysis_dir,
+              })
+            }
+          }
+        }
+        // Out-of-context side-effect ledger: record every non-file side-effect
+        // tool call (bash/shell with docker/db/network/system/package mutations,
+        // webfetch POST/PUT, etc.) so a turn whose work is purely runtime/infra
+        // state still reaches the code reviewer's triage step. The bash tool's
+        // `description` is the LLM's stated reason for the call (often the
+        // most useful context for the reviewer) and we keep the full command +
+        // a small output preview so triage can spot "permission denied" vs
+        // "container id abc123" without re-running the command.
+        const liveCfg2 = yield* config.get()
+        if (liveCfg2.code_reviewer?.side_effect_ledger ?? true) {
+          const toolName = match.part.tool
+          const input = (match.part.state.input ?? {}) as Record<string, unknown>
+          const isShellLike = toolName === "bash" || toolName === "shell"
+          // Some tools (http/webfetch) are network-mutating by nature when they
+          // take a body; we only record shell-like tools here to keep the
+          // ledger focused on bash/CLI side effects. Network tools are out of
+          // scope for v1 — they could be added later by widening this check.
+          if (isShellLike) {
+            const md = output.metadata ?? {}
+            const command = typeof input["command"] === "string" ? (input["command"] as string) : ""
+            const description = typeof input["description"] === "string" ? (input["description"] as string) : ""
+            // The bash tool stores its final exit code and the captured output
+            // under `output` and `metadata.exit` (see shell.ts). The output
+            // string already includes stdout+stderr merged; preview the head.
+            if (command.trim()) {
+              yield* SideEffectLedger.record({
+                sessionID: ctx.sessionID,
+                tool: toolName,
+                command,
+                description: description || (typeof md["description"] === "string" ? (md["description"] as string) : ""),
+                output: output.output ?? "",
+                exit: typeof md["exit"] === "number" ? (md["exit"] as number) : undefined,
+                base: liveCfg2.experimental?.api_analysis_dir,
               })
             }
           }
