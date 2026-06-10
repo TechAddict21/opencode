@@ -413,6 +413,10 @@ export const Info = Schema.Struct({
         description:
           "Globally disable extended thinking/reasoning for ALL LLM calls (main agent, fixer, and reviewers) by stripping every provider's thinking-enable flag (thinking, enable_thinking, reasoningEffort, thinkingConfig, …) from the request. This is exactly what small/reviewer calls already do (they omit the key and never emit reasoning), applied to the main agent's full-model calls too — cutting latency and runaway reasoning spirals. Set false to restore per-model thinking (default: true).",
       }),
+      knowledge_in_system: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Inject the knowledge-base context into the system prompt (legacy placement) instead of transiently prepending it to the latest user message. The default user-message placement preserves the provider's prompt-prefix cache across turns — a per-turn injection in the system prompt re-reads the whole conversation uncached every time it changes (default: false).",
+      }),
     }),
   ),
   hooks: Schema.optional(ConfigHook.Hooks).annotate({

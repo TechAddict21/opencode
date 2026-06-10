@@ -8,7 +8,7 @@ import * as Session from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
-import { type Tool as AITool, tool, jsonSchema } from "ai"
+import { type Tool as AITool, type ModelMessage, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { Bus } from "../bus"
@@ -73,6 +73,25 @@ import { Snapshot } from "@/snapshot"
 globalThis.AI_SDK_LOG_WARNINGS = false
 
 const decodeMessageInfo = Schema.decodeUnknownExit(MessageV2.Info)
+
+// Transiently prepend the knowledge injection to the LAST user message instead
+// of the system prompt. The system prompt heads the provider's prefix cache, so
+// a per-turn injection there invalidates the cache for the ENTIRE conversation
+// every time it changes; the last user message is already this turn's fresh
+// suffix, and by the next turn it is stable history that caches normally.
+// Mutates only the outgoing model messages — never the stored session.
+function injectKnowledgeIntoLastUser(modelMsgs: ModelMessage[], injection: string): boolean {
+  const wrapped = `<project-knowledge>\n${injection}\n</project-knowledge>\n\n`
+  for (let i = modelMsgs.length - 1; i >= 0; i--) {
+    const m = modelMsgs[i]
+    if (m.role !== "user") continue
+    if (typeof m.content === "string") m.content = wrapped + m.content
+    else if (Array.isArray(m.content)) m.content.unshift({ type: "text", text: wrapped })
+    else return false
+    return true
+  }
+  return false
+}
 const decodeMessagePart = Schema.decodeUnknownExit(MessageV2.Part)
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
@@ -1781,7 +1800,14 @@ export const layer = Layer.effect(
               }),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
-            if (knowledgeContext) system.push(knowledgeContext)
+            if (knowledgeContext) {
+              // Cache-friendly default: ride the last user message. The legacy
+              // system-prompt placement stays behind a config flag for rollback.
+              const inSystem = promptCfg.experimental?.knowledge_in_system ?? false
+              if (inSystem || !injectKnowledgeIntoLastUser(modelMsgs, knowledgeContext)) {
+                system.push(knowledgeContext)
+              }
+            }
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const result = yield* handle.process({

@@ -31,6 +31,7 @@ import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
 import { DbCommand } from "./cli/cmd/db"
+import { KbCommand } from "./cli/cmd/kb"
 import path from "path"
 import { Global } from "@nous-ai/core/global"
 import { JsonMigration } from "@/storage/json-migration"
@@ -167,6 +168,7 @@ const cli = yargs(args)
   .command(SessionCommand)
   .command(PluginCommand)
   .command(DbCommand)
+  .command(KbCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||

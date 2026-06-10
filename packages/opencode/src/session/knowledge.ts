@@ -7,6 +7,9 @@ import { Provider } from "@/provider/provider"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import * as KB from "./knowledge-base"
+import * as FileMap from "./knowledge-file-map"
+import * as Queue from "./knowledge-queue"
+import { ChangeLedger } from "./change-ledger"
 import { KnowledgeLog } from "./knowledge-log"
 import * as Log from "@nous-ai/core/util/log"
 import { LLMEvent } from "@nous-ai/llm"
@@ -32,10 +35,21 @@ interface IndexEntry {
   paths: Set<string>
 }
 
+// Pre-tokenized view of one FILE_MAP entry so per-query matching is set lookups,
+// not re-tokenization.
+interface FileIndexEntry {
+  entry: FileMap.FileMapEntry
+  base: string
+  dir: string
+  pathTokens: Set<string>
+  purposeTokens: Set<string>
+  symbolsLower: Set<string>
+}
+
 // In-memory search index over the knowledge base, rebuilt only when the tree
 // changes. Lets the feeder match against doc contents (not just the lean tree
 // summary) and do exact source-path lookups — fast and accurate.
-interface KBIndex {
+export interface KBIndex {
   treeContent: string
   entries: IndexEntry[]
   pathToEntries: Map<string, string[]>
@@ -44,6 +58,9 @@ interface KBIndex {
   // Inverse document frequency per token across the area docs. Lets the matcher
   // reward rare, discriminating terms over ones that appear in every doc.
   idf: Map<string, number>
+  // The fine-grained file→purpose layer (FILE_MAP.jsonl), pre-tokenized.
+  files: FileIndexEntry[]
+  fileByPath: Map<string, FileMap.FileMapEntry>
 }
 
 interface Cache {
@@ -55,6 +72,10 @@ interface Cache {
   // text dropped the original keywords ("now refactor it") can still re-orient.
   lastMatched: string[]
   followupCount: number
+  // Completer-run counter + the run at which each area was last enriched, so
+  // UPDATE-mode rewrites of the same doc are rate-limited within a session.
+  completerRuns: number
+  areaEnrichedAtRun: Record<string, number>
 }
 
 // Match at most this many areas per query. The tree is a router, not a search
@@ -71,20 +92,46 @@ const MIN_SCORE = 3
 // turn's matched areas before we stop re-injecting stale context.
 const FOLLOWUP_REUSE_LIMIT = 2
 
-// Generic words that should never drive a knowledge-area match. Without this,
-// queries match on "service"/"controller"/"admin" etc. and select half the tree.
+// Completer shape limits: how many distinct areas one turn may write, how many
+// areas an enrichment pass may rewrite, and how long an enriched area rests
+// before it can be rewritten again (in completer runs, not turns).
+const MAX_AREAS_PER_TURN = 3
+const MAX_ENRICH_AREAS = 2
+const ENRICH_COOLDOWN_RUNS = 3
+// Each enrichment target doc is trimmed to this before being shown to the model.
+const ENRICH_DOC_CAP = 6144
+// The agent's own final analysis is the most distilled knowledge a turn makes.
+const FINAL_TEXT_BYTES = 4000
+// A turn with this much final analysis and tool activity carries insight worth
+// folding into existing docs even when no new files were explored.
+const INSIGHT_TEXT_MIN = 600
+const INSIGHT_TOOL_CALLS_MIN = 3
+// Queue drain sizes: alongside a normal completer call, and for a solo
+// map-focused call when the turn would otherwise skip entirely (only worth a
+// model call once the backlog is deep enough).
+const QUEUE_DRAIN_MAIN = 5
+const QUEUE_DRAIN_SOLO = 8
+const MIN_QUEUE_SOLO = 10
+// Cap harvested grep/glob result paths per tool call.
+const SEARCH_HARVEST_PER_CALL = 15
+// File-map injection: max matched entries and byte budget of the rendered block.
+const FILE_MATCH_LIMIT = 12
+const FILE_BLOCK_BYTES = 2048
+
+// Function words that should never drive a knowledge-area match. Deliberately
+// excludes domain nouns ("service", "controller", "session", "error"…): those
+// DO discriminate in many projects, and the IDF weighting already de-weights
+// any term that appears in every doc.
 const STOPWORDS = new Set([
-  "the", "and", "for", "with", "this", "that", "code", "file", "files", "service",
-  "services", "controller", "controllers", "admin", "src", "function", "functions",
+  "the", "and", "for", "with", "this", "that", "code", "file", "files",
   "please", "help", "fix", "fixed", "fixes", "add", "adds", "added", "update",
   "updates", "updated", "change", "changes", "changed", "make", "made", "need",
   "needs", "want", "wants", "get", "set", "how", "what", "where", "why", "does",
-  "use", "uses", "using", "used", "module", "modules", "class", "method", "methods",
+  "use", "uses", "using", "used",
   "into", "from", "your", "you", "are", "can", "should", "there", "their", "them",
-  "when", "which", "also", "handle", "handles", "handling", "data", "logic", "main",
-  "core", "new", "all", "any", "but", "not", "our", "its", "via", "per", "let",
+  "when", "which", "also",
+  "new", "all", "any", "but", "not", "our", "its", "via", "per", "let",
   "may", "run", "see", "one", "two", "out", "off", "now", "has", "had", "was",
-  "implement", "implementation", "feature", "issue", "bug", "error", "errors",
 ])
 
 function tokenize(text: string): string[] {
@@ -123,57 +170,185 @@ function isFrontendQuery(text: string): boolean {
 //   3. directory hit — query file's folder is documented by an area
 //   4. exact token overlap with area name / summary / doc text
 //   5. partial (substring) token overlap — the "try harder" fallback
-function matchEntries(userText: string, index: KBIndex): string[] {
+export function matchEntries(userText: string, index: KBIndex): string[] {
   const queryTokens = tokenize(userText)
   const queryPaths = extractQueryPaths(userText)
-  const scores = new Map<string, number>()
-  const add = (ep: string, s: number) => scores.set(ep, (scores.get(ep) ?? 0) + s)
+  const pathScores = new Map<string, number>()
+  const addPath = (ep: string, s: number) => pathScores.set(ep, (pathScores.get(ep) ?? 0) + s)
 
   for (const qp of queryPaths) {
-    for (const ep of index.pathToEntries.get(qp) ?? []) add(ep, 12)
+    for (const ep of index.pathToEntries.get(qp) ?? []) addPath(ep, 12)
     const base = qp.split("/").pop()?.toLowerCase()
-    if (base) for (const ep of index.baseToEntries.get(base) ?? []) add(ep, 6)
+    if (base) for (const ep of index.baseToEntries.get(base) ?? []) addPath(ep, 6)
     // Directory hit: a file we don't know yet, but whose folder is already
     // documented, almost certainly belongs to that same area.
     const dir = qp.includes("/") ? qp.slice(0, qp.lastIndexOf("/")) : ""
-    if (dir) for (const ep of index.dirToEntries.get(dir) ?? []) add(ep, 4)
+    if (dir) for (const ep of index.dirToEntries.get(dir) ?? []) addPath(ep, 4)
   }
 
+  // Text pass, tracked separately from path passes: an entry with no path
+  // evidence needs either two distinct exact token hits or one strong (rare)
+  // hit — a lone common-token or substring overlap selects nothing.
+  const textScores = new Map<string, { score: number; exactHits: number }>()
   for (const entry of index.entries) {
     let s = 0
+    let exactHits = 0
     for (const qt of queryTokens) {
       // Rarity boost (≈IDF): a term in one doc discriminates far better than one
       // in every doc. Neutral fallback (1) for tokens not in the index.
       const w = index.idf.get(qt) ?? 1
       if (entry.tokens.has(qt)) {
         s += 2 * w
+        exactHits += 1
         continue
       }
+      if (qt.length < 5) continue
       for (const ht of entry.tokens) {
-        if (ht.length >= 4 && (ht.includes(qt) || qt.includes(ht))) {
-          s += 1 * w
+        if (ht.length >= 5 && (ht.includes(qt) || qt.includes(ht))) {
+          s += 0.5 * w
           break
         }
       }
     }
-    if (s > 0) add(entry.entryPath, s)
+    if (s > 0) textScores.set(entry.entryPath, { score: s, exactHits })
   }
 
   const byPath = new Map(index.entries.map((e) => [e.entryPath, e] as const))
-  return [...scores.entries()]
-    .filter(([ep, s]) => {
+  const all = new Set([...pathScores.keys(), ...textScores.keys()])
+  return [...all]
+    .map((ep) => {
+      const p = pathScores.get(ep) ?? 0
+      const t = textScores.get(ep)
+      return { ep, total: p + (t?.score ?? 0), pathScore: p, textScore: t?.score ?? 0, exactHits: t?.exactHits ?? 0 }
+    })
+    .filter(({ ep, total, pathScore, textScore, exactHits }) => {
       // Floor: a lone weak hit (single common token / substring) is noise — don't
       // spend the injection budget on it. Path-pass matches always clear this.
-      if (s < MIN_SCORE) return false
+      if (total < MIN_SCORE) return false
+      if (pathScore === 0 && exactHits < 2 && textScore < 4) return false
       // Never spend a result slot on a dangling pointer — an area whose doc is
       // missing/empty and which covers no source paths has nothing to inject.
       const e = byPath.get(ep)
       if (e && !e.docText.trim() && e.paths.size === 0) return false
       return true
     })
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b.total - a.total)
     .slice(0, TOP_AREAS)
-    .map(([ep]) => ep)
+    .map(({ ep }) => ep)
+}
+
+// Match the user's query against the fine-grained file map: exact path, then
+// basename, then directory, then symbol/path/purpose tokens. Strong enough
+// hits only — one purpose-token overlap alone never surfaces a file.
+export function matchFileMap(userText: string, index: KBIndex): FileMap.FileMapEntry[] {
+  if (index.files.length === 0) return []
+  const queryTokens = tokenize(userText)
+  const queryPaths = extractQueryPaths(userText)
+  const scores = new Map<string, number>()
+  const add = (p: string, s: number) => scores.set(p, (scores.get(p) ?? 0) + s)
+
+  for (const qp of queryPaths) {
+    const base = qp.split("/").pop()?.toLowerCase()
+    const dir = qp.includes("/") ? qp.slice(0, qp.lastIndexOf("/")) : ""
+    for (const f of index.files) {
+      if (f.entry.path === qp) add(f.entry.path, 12)
+      else if (base && f.base === base) add(f.entry.path, 6)
+      else if (dir && f.dir === dir) add(f.entry.path, 3)
+    }
+  }
+  for (const qt of queryTokens) {
+    for (const f of index.files) {
+      if (f.symbolsLower.has(qt)) add(f.entry.path, 4)
+      else if (f.pathTokens.has(qt)) add(f.entry.path, 2)
+      else if (f.purposeTokens.has(qt)) add(f.entry.path, 1)
+    }
+  }
+  return [...scores.entries()]
+    .filter(([, s]) => s >= MIN_SCORE)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, FILE_MATCH_LIMIT)
+    .map(([p]) => index.fileByPath.get(p))
+    .filter((e): e is FileMap.FileMapEntry => !!e)
+}
+
+// Pure index construction over pre-read inputs: tree content, each entry's doc
+// text, and the parsed file map. Sync and deterministic so the matcher can be
+// exercised in tests against fixture knowledge bases.
+export function buildIndexPure(
+  treeContent: string,
+  docTexts: Map<string, string>,
+  fileByPath: Map<string, FileMap.FileMapEntry>,
+): KBIndex {
+  const entries: IndexEntry[] = []
+  const pathToEntries = new Map<string, string[]>()
+  const baseToEntries = new Map<string, string[]>()
+  const dirToEntries = new Map<string, string[]>()
+  const push = (map: Map<string, string[]>, key: string, ep: string) => {
+    const arr = map.get(key)
+    if (arr) arr.push(ep)
+    else map.set(key, [ep])
+  }
+  for (const e of KB.parseTree(treeContent)) {
+    if (e.entryPath.includes("..") || e.entryPath.startsWith("/")) continue
+    const docText = docTexts.get(e.entryPath) ?? ""
+    const paths = new Set<string>()
+    for (const rp of e.readPaths) {
+      const n = normalizePath(rp)
+      if (n) paths.add(n)
+    }
+    for (const m of docText.matchAll(QUERY_PATH_RE)) {
+      const n = normalizePath(m[0])
+      if (n && !n.endsWith(".md") && !n.startsWith(KB.KB_DIR_NAME + "/")) paths.add(n)
+    }
+    const tokens = new Set(
+      tokenize(e.entryPath.replace(/\.md$/i, "").replace(/[/_]/g, " ") + " " + e.description + " " + docText),
+    )
+    entries.push({ entryPath: e.entryPath, summary: e.description, docText, tokens, paths })
+    for (const p of paths) {
+      push(pathToEntries, p, e.entryPath)
+      const base = p.split("/").pop()
+      if (base) push(baseToEntries, base.toLowerCase(), e.entryPath)
+      if (p.includes("/")) push(dirToEntries, p.slice(0, p.lastIndexOf("/")), e.entryPath)
+    }
+  }
+  // Rarity boost per token (≈IDF): a token in fewer area docs is more
+  // discriminating. Normalized by doc count so it behaves the same for a
+  // 3-area KB as a 300-area one; range [1, 2.5).
+  const df = new Map<string, number>()
+  for (const e of entries) for (const t of e.tokens) df.set(t, (df.get(t) ?? 0) + 1)
+  const n = Math.max(1, entries.length)
+  const idf = new Map<string, number>()
+  for (const [t, d] of df) idf.set(t, 1 + 1.5 * (1 - d / n))
+  // The fine-grained file→purpose layer, pre-tokenized for cheap matching.
+  const files: FileIndexEntry[] = []
+  for (const entry of fileByPath.values()) {
+    files.push({
+      entry,
+      base: entry.path.split("/").pop()?.toLowerCase() ?? "",
+      dir: entry.path.includes("/") ? entry.path.slice(0, entry.path.lastIndexOf("/")) : "",
+      pathTokens: new Set(tokenize(entry.path.replace(/[/._-]/g, " "))),
+      purposeTokens: new Set(tokenize(entry.purpose)),
+      symbolsLower: new Set(entry.symbols.map((s) => s.toLowerCase())),
+    })
+  }
+  return { treeContent, entries, pathToEntries, baseToEntries, dirToEntries, idf, files, fileByPath }
+}
+
+// Render matched file-map entries as the injection's "what's where" block.
+function renderFileMapBlock(entries: FileMap.FileMapEntry[]): string {
+  if (entries.length === 0) return ""
+  const lines: string[] = []
+  let total = 0
+  for (const e of entries) {
+    if (!e.purpose) continue
+    const sym = e.symbols.length ? ` (symbols: ${e.symbols.join(", ")})` : ""
+    const line = `- \`${e.path}\` — ${e.purpose}${sym}`
+    if (total + line.length + 1 > FILE_BLOCK_BYTES) break
+    lines.push(line)
+    total += line.length + 1
+  }
+  if (lines.length === 0) return ""
+  return "### File map (what's where)\n" + lines.join("\n")
 }
 
 // Fallback when nothing matched a conceptual query: surface the whole KB index
@@ -187,84 +362,12 @@ function assembleIndexHint(index: KBIndex): string {
   return body
 }
 
-const DOC_TRUNC_MARKER = "\n... [truncated — read the source files for more]"
-
-// Split a doc into its lead (text before the first "## " section, i.e. the
-// title + overview) and its "## "-level sections, each keeping its literal
-// heading line. Used to trim a doc by whole sections instead of mid-text.
-function splitForFit(docText: string): { lead: string; sections: { title: string; body: string }[] } {
-  const lines = docText.split("\n")
-  const leadLines: string[] = []
-  const sections: { title: string; body: string[] }[] = []
-  let cur: { title: string; body: string[] } | null = null
-  for (const line of lines) {
-    if (/^##\s+.+/.test(line)) {
-      if (cur) sections.push(cur)
-      cur = { title: line.trimEnd(), body: [] }
-    } else if (cur) {
-      cur.body.push(line)
-    } else {
-      leadLines.push(line)
-    }
-  }
-  if (cur) sections.push(cur)
-  return {
-    lead: leadLines.join("\n").trim(),
-    sections: sections.map((s) => ({ title: s.title, body: s.body.join("\n").replace(/\s+$/, "") })),
-  }
-}
-
-// Trim one doc to `cap` bytes preserving the most useful content first: the
-// lead/overview, then "Key Files", then remaining sections in original order.
-// Whole sections are dropped rather than sliced mid-text; if Key Files itself
-// overflows it is cut at the last complete bullet so no half-path survives.
-function fitDoc(docText: string, cap: number): string {
-  if (docText.length <= cap) return docText
-  const { lead, sections } = splitForFit(docText)
-  const keyIdx = sections.findIndex((s) => /\bfiles?\b/i.test(s.title))
-  const order: number[] = []
-  if (keyIdx >= 0) order.push(keyIdx)
-  sections.forEach((_, i) => { if (i !== keyIdx) order.push(i) })
-
-  let out = lead
-  if (out.length > cap) return out.slice(0, Math.max(0, cap - DOC_TRUNC_MARKER.length)) + DOC_TRUNC_MARKER
-
-  let truncated = false
-  for (const i of order) {
-    const sec = sections[i]
-    const block = sec.title + (sec.body ? "\n" + sec.body : "")
-    if (!block.trim()) continue
-    if (out.length + 1 + block.length <= cap) {
-      out += "\n" + block
-      continue
-    }
-    // Key Files is the highest-value section — salvage as many whole bullets as
-    // fit rather than dropping it entirely, but never emit a partial path.
-    if (i === keyIdx) {
-      const room = cap - out.length - 1 - sec.title.length - 1 - DOC_TRUNC_MARKER.length
-      const kept: string[] = []
-      let used = 0
-      for (const bullet of sec.body.split("\n")) {
-        if (used + bullet.length + 1 > room) break
-        kept.push(bullet)
-        used += bullet.length + 1
-      }
-      if (kept.length > 0) {
-        out += "\n" + sec.title + "\n" + kept.join("\n")
-      }
-    }
-    truncated = true
-    // keep scanning — a later, smaller section may still fit under the cap
-  }
-  if (truncated && !out.endsWith(DOC_TRUNC_MARKER)) out += DOC_TRUNC_MARKER
-  return out
-}
-
 // Build the injection text from the matched docs (held in the cached index, so
 // no disk reads here). Reserves a fair budget floor per matched area so a large
 // top match cannot starve the 2nd/3rd matches, and trims each doc by section
-// priority rather than a raw byte cut.
-function assembleDocs(index: KBIndex, matched: string[]): string {
+// priority rather than a raw byte cut. `budget` shrinks when other injection
+// blocks (the file map) already spent part of MAX_INJECTION_BYTES.
+function assembleDocs(index: KBIndex, matched: string[], budget = KB.MAX_INJECTION_BYTES): string {
   const byPath = new Map(index.entries.map((e) => [e.entryPath, e] as const))
   const present = matched.filter((ep) => {
     const e = byPath.get(ep)
@@ -272,11 +375,11 @@ function assembleDocs(index: KBIndex, matched: string[]): string {
   })
   if (present.length === 0) return ""
 
-  const floor = Math.max(1, Math.floor(KB.MAX_INJECTION_BYTES / present.length))
+  const floor = Math.max(1, Math.floor(budget / present.length))
   const parts: string[] = []
   let total = 0
   present.forEach((ep, i) => {
-    const remainingTotal = KB.MAX_INJECTION_BYTES - total
+    const remainingTotal = budget - total
     if (remainingTotal <= 0) return
     const entry = byPath.get(ep)!
     const header = `\n### ${ep}\n`
@@ -286,7 +389,7 @@ function assembleDocs(index: KBIndex, matched: string[]): string {
     const reserveForRest = floor * (areasLeft - 1)
     const cap = Math.min(remainingTotal, Math.max(floor, remainingTotal - reserveForRest)) - header.length
     if (cap <= 0) return
-    const body = fitDoc(entry.docText, cap)
+    const body = KB.fitDoc(entry.docText, cap)
     if (!body.trim()) return
     parts.push(header + body)
     total += header.length + body.length
@@ -349,8 +452,8 @@ function collectExploredPaths(messages: MessageV2.WithParts[], workDir: string):
 // Cap how much evidence (a read preview or an edit/write diff) is shown per
 // file, and the aggregate across all files, so grounding the completer stays
 // bounded and cheap.
-const EVIDENCE_PER_FILE_BYTES = 900
-const EVIDENCE_TOTAL_BYTES = 5000
+const EVIDENCE_PER_FILE_BYTES = 1200
+const EVIDENCE_TOTAL_BYTES = 12000
 
 // Collect concrete evidence — actual content the agent saw this turn — for each
 // target file: a `read` preview (clean head of file) or, failing that, an
@@ -417,7 +520,7 @@ function formatHistorySnippet(messages: MessageV2.WithParts[], workDir: string):
       .filter((p): p is MessageV2.TextPart => p.type === "text")
       .map((p) => p.text)
       .join(" ")
-      .slice(0, 400)
+      .slice(0, 700)
     if (role === "user") {
       if (text) lines.push(`[user] ${text}`)
     } else if (role === "assistant") {
@@ -444,8 +547,6 @@ function formatHistorySnippet(messages: MessageV2.WithParts[], workDir: string):
   return lines.join("\n")
 }
 
-const KEYFILE_PATH_RE = /(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z][\w]*/
-
 // The doc path the tree currently points at for `areaName`, resolved the same
 // way parseTree resolves a slash-less name (under the area's folder). Lets the
 // completer reuse an existing area's doc file instead of orphaning it.
@@ -459,7 +560,9 @@ function docPathForArea(treeContent: string, areaName: string): string | null {
       continue
     }
     if (!inArea) continue
-    const em = line.trim().match(/^-\s+\*{0,2}([^\s*]+\.md)\*{0,2}\s*[—–-]/)
+    // Same space-tolerant path shape as KB.parseTree — area folders routinely
+    // contain spaces.
+    const em = line.trim().match(/^-\s+\*{0,2}([^*]+?\.md)\*{0,2}\s*[—–-]/)
     if (em) {
       const raw = em[1]
       if (raw.includes("/")) return raw
@@ -490,81 +593,123 @@ function normalizeKeyFilePaths(docBody: string, files: string[]): string {
   })
 }
 
-// Merge a freshly written area doc with the area's previous doc so REUSING an
-// existing area never silently loses its earlier Key Files. The new doc (with
-// its refreshed overview/notes) is the base; any prior Key-Files bullet whose
-// path the new doc omits is carried over.
-function mergeAreaDoc(existingDoc: string, newDoc: string): string {
-  const keyFilesSection = (doc: string): { start: number; end: number; bullets: string[] } | null => {
-    const lines = doc.split("\n")
-    const start = lines.findIndex((l) => /^##\s+.*\bfiles?\b/i.test(l))
-    if (start < 0) return null
-    let end = lines.length
-    for (let i = start + 1; i < lines.length; i++) {
-      if (/^##\s+/.test(lines[i])) {
-        end = i
-        break
+// The agent's own final analysis this turn — the most distilled knowledge a
+// turn produces, and the completer's highest-value evidence.
+function collectFinalText(messages: MessageV2.WithParts[]): string {
+  const lastUserIdx = messages.findLastIndex((m) => m.info.role === "user")
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages
+  for (let i = slice.length - 1; i >= 0; i--) {
+    const msg = slice[i]
+    if (msg.info.role !== "assistant") continue
+    const text = msg.parts
+      .filter((p): p is MessageV2.TextPart => p.type === "text")
+      .map((p) => p.text)
+      .join("\n")
+      .trim()
+    if (text) return text.slice(0, FINAL_TEXT_BYTES)
+  }
+  return ""
+}
+
+function countCompletedToolCalls(messages: MessageV2.WithParts[]): number {
+  const lastUserIdx = messages.findLastIndex((m) => m.info.role === "user")
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages
+  let n = 0
+  for (const msg of slice) {
+    if (msg.info.role !== "assistant") continue
+    for (const part of msg.parts) {
+      if (part.type !== "tool") continue
+      const state = (part as MessageV2.ToolPart).state as any
+      if (state && state.status === "completed") n++
+    }
+  }
+  return n
+}
+
+// Files the agent read this turn — drives the redundancy metric (re-reads of
+// files the map already knows are the waste this system exists to remove).
+function collectReadRels(messages: MessageV2.WithParts[], workDir: string): string[] {
+  const out = new Set<string>()
+  const lastUserIdx = messages.findLastIndex((m) => m.info.role === "user")
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages
+  for (const msg of slice) {
+    if (msg.info.role !== "assistant") continue
+    for (const part of msg.parts) {
+      if (part.type !== "tool") continue
+      const tp = part as MessageV2.ToolPart
+      if (tp.tool !== "read") continue
+      const state = tp.state as any
+      if (!state || state.status !== "completed") continue
+      for (const raw of extractInputPaths(state.input)) {
+        const rel = toRelUnderWorkDir(raw, workDir)
+        if (rel) out.add(rel)
       }
     }
-    const bullets = lines.slice(start + 1, end).filter((l) => /^-\s+/.test(l.trim()))
-    return { start, end, bullets }
   }
-  const pathOf = (bullet: string): string | null => {
-    const m = bullet.match(KEYFILE_PATH_RE)
-    return m ? normalizePath(m[0]) : null
+  return [...out]
+}
+
+// Paths surfaced by grep/glob results this turn. These never carry read/diff
+// evidence, so they can't be documented immediately — they feed the pending
+// queue so a later turn can. Junk dirs are dropped at the source.
+const HARVEST_SKIP_RE = /(^|\/)(node_modules|\.git|dist|build|out|coverage|vendor)(\/|$)/
+
+function collectSearchedPaths(
+  messages: MessageV2.WithParts[],
+  workDir: string,
+): { path: string; reason: "grep-hit" | "glob-hit"; hint?: string }[] {
+  const out = new Map<string, { path: string; reason: "grep-hit" | "glob-hit"; hint?: string }>()
+  const lastUserIdx = messages.findLastIndex((m) => m.info.role === "user")
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages
+  for (const msg of slice) {
+    if (msg.info.role !== "assistant") continue
+    for (const part of msg.parts) {
+      if (part.type !== "tool") continue
+      const tp = part as MessageV2.ToolPart
+      if (tp.tool !== "grep" && tp.tool !== "glob") continue
+      const state = tp.state as any
+      if (!state || state.status !== "completed") continue
+      const output = typeof state.output === "string" ? state.output : ""
+      if (!output.trim()) continue
+      const raw = tp.tool === "grep" ? Queue.harvestGrepPaths(output) : Queue.harvestGlobPaths(output)
+      const input = (state.input ?? {}) as Record<string, unknown>
+      const pattern = typeof input.pattern === "string" ? input.pattern : ""
+      const hint = pattern ? `${tp.tool === "grep" ? "pattern" : "glob"}: ${pattern}`.slice(0, 80) : undefined
+      const reason = tp.tool === "grep" ? ("grep-hit" as const) : ("glob-hit" as const)
+      for (const r of raw.slice(0, SEARCH_HARVEST_PER_CALL)) {
+        const rel = toRelUnderWorkDir(r, workDir)
+        if (!rel || HARVEST_SKIP_RE.test(rel)) continue
+        if (!out.has(rel)) out.set(rel, { path: rel, reason, hint })
+      }
+    }
   }
-
-  const oldSec = keyFilesSection(existingDoc)
-  if (!oldSec || oldSec.bullets.length === 0) return newDoc
-
-  const oldLines = existingDoc.split("\n")
-  const newSec = keyFilesSection(newDoc)
-  if (!newSec) {
-    // New doc has no Key Files section — append the old one wholesale.
-    return newDoc.replace(/\s+$/, "") + "\n\n" + oldLines[oldSec.start] + "\n" + oldSec.bullets.join("\n") + "\n"
-  }
-
-  const havePaths = new Set(newSec.bullets.map(pathOf).filter((p): p is string => !!p))
-  const carry = oldSec.bullets.filter((b) => {
-    const p = pathOf(b)
-    return p ? !havePaths.has(p) : false
-  })
-  if (carry.length === 0) return newDoc
-
-  const lines = newDoc.split("\n")
-  let insertAt = newSec.start + 1
-  for (let i = newSec.start + 1; i < newSec.end; i++) {
-    if (/^-\s+/.test(lines[i].trim())) insertAt = i + 1
-  }
-  lines.splice(insertAt, 0, ...carry)
-  return lines.join("\n")
+  return [...out.values()]
 }
 
 const COMPLETER_SYSTEM_PROMPT = `You curate a project knowledge base that lets a coding agent avoid re-exploring the same code every session.
 
-The knowledge base has two pieces:
+The knowledge base has three pieces:
 - DRILL_DOWN_TREE.md — a LEAN index. ONE entry per knowledge AREA (a domain or feature such as "Collection", "CIBIL & Bureau", "Disbursement"). Each entry is ONLY a pointer to that area's doc plus a one-line description. It contains NO source-file paths.
 - One distilled doc per area — this is where detail lives: how the area works AND a "## Key Files" section mapping each source file to its use case.
+- A per-file map (path → one-line purpose + key symbols). You never write this file directly: you emit a FILES section and the system maintains the map.
 
-You are given:
-1. The recent conversation (what the user wanted, the tools that ran, and the files explored).
-2. The list of EXISTING areas already in the knowledge base.
-3. Files explored this session that are NOT yet covered by the knowledge base.
-4. Evidence: head/diff excerpts of those files — the actual content the agent saw this session.
-5. The current DRILL_DOWN_TREE.md.
+You may be given any of:
+1. The recent conversation (what the user wanted, the tools that ran, the files explored).
+2. The agent's conclusions — its own final analysis this turn. This is the most distilled knowledge available; prefer it over guessing from code excerpts.
+3. The list of EXISTING areas already in the knowledge base.
+4. NEW files explored this turn that the file map does not know yet, with evidence (head/diff excerpts).
+5. STALE files — mapped before, but their content has changed; their previously recorded purpose is shown alongside current evidence.
+6. QUEUED files — explored in earlier turns but never documented, with fresh head excerpts.
+7. UPDATE mode: the CURRENT TEXT of one or more existing area docs this turn's work touched.
+8. The current DRILL_DOWN_TREE.md.
 
-Your job: capture what was learned about ONE area this session so next time the agent can skip the exploration.
+Your job: capture what was learned this turn so next time the agent can skip the exploration.
 
-Rules:
-- Output AT MOST ONE area — the one that best fits the files explored this session.
-- REUSE by default. If the explored files plausibly belong to one of the EXISTING areas, REUSE that area's EXACT name, character-for-character — do NOT invent a near-duplicate. Singular/plural and near-synonym variants (e.g. "Collection" vs "Collections") are the SAME area, never a new one. Create a NEW area ONLY when none of the existing ones fit.
-- The TREE entry is ONLY the doc pointer + a one-line summary. NEVER put source-file paths in the tree.
-- Put EVERY source-file path inside the DOC's "## Key Files" section, one per line as: \`path/to/file.ext\` — its use case. Always write the FULL workspace-relative path (with directories), never a bare filename.
-- Ground every Key-Files use-case in the provided Evidence. Do NOT document a file that has no Evidence entry, and do NOT invent behaviour, endpoints, or files that are not visible in the Evidence or the conversation.
-- The doc is a distilled SUMMARY (responsibilities, key flows, gotchas) plus Key Files — NOT a copy of the code. Keep it under ~120 lines.
-- If nothing reusable was learned, output exactly: ## SKIP
+Output EXACTLY this structure and nothing else (FILES first, then 0 to ${MAX_AREAS_PER_TURN} AREA blocks):
 
-Output EXACTLY this structure and nothing else:
+## FILES
+src/path/one.ts | one-line purpose, <=140 chars | symbolA, symbolB
+src/path/two.ts | one-line purpose | symbolC
 
 ## AREA
 name: <Area Name>
@@ -581,7 +726,90 @@ summary: <one line, <=120 chars, describing the area — NO file paths>
 
 ## Notes
 <key flows, gotchas, anything non-obvious — omit if nothing to add>
-## END`
+## END
+
+Rules:
+- FILES: one line per listed file (NEW, STALE, or QUEUED) whose purpose you can ground in the evidence or the agent's conclusions. Use ONLY paths from the provided lists, exactly as written — NEVER invent or alter a path. Purpose <=140 chars. Up to 8 key symbols (exported functions/classes/types visible in the evidence); leave the symbols segment empty if unknown.
+- AREA blocks: 0 to ${MAX_AREAS_PER_TURN}, one per genuinely distinct domain touched this turn — most turns need exactly ONE. Repeat the full "## AREA ... ## END" structure for each.
+- REUSE by default. If the files plausibly belong to one of the EXISTING areas, REUSE that area's EXACT name, character-for-character — do NOT invent a near-duplicate. Singular/plural and near-synonym variants (e.g. "Collection" vs "Collections") are the SAME area, never a new one. Create a NEW area ONLY when none of the existing ones fit.
+- The TREE entry is ONLY the doc pointer + a one-line summary. NEVER put source-file paths in the tree.
+- Put EVERY source-file path inside the DOC's "## Key Files" section, one per line as: \`path/to/file.ext\` — its use case. Always write the FULL workspace-relative path (with directories), never a bare filename.
+- Ground every claim in the provided evidence or the agent's conclusions. Do NOT invent behaviour, endpoints, or files.
+- UPDATE mode (an area doc's CURRENT TEXT is provided): output that area's AREA block as an IMPROVED rewrite — correct statements the evidence contradicts, deepen Notes with this turn's findings, refresh Key Files lines for STALE files, and keep everything still accurate. Do not merely restate the old text.
+- Each doc is a distilled SUMMARY (responsibilities, key flows, gotchas) plus Key Files — NOT a copy of the code. Keep it under ~120 lines.
+- If nothing reusable was learned, output exactly: ## SKIP`
+
+export interface CompleterFileLine {
+  path: string
+  purpose: string
+  symbols: string[]
+}
+
+export interface CompleterAreaBlock {
+  name: string
+  doc: string
+  summary: string
+  body: string
+}
+
+// Parse the completer model's response: a "## FILES" section of `path |
+// purpose | symbols` lines plus 0..N "## AREA" blocks. Tolerant by design —
+// a malformed block is dropped (and counted by the caller) without sinking
+// the valid ones, and FILES alone is a useful result.
+export function parseCompleterResponse(text: string): {
+  files: CompleterFileLine[]
+  areas: CompleterAreaBlock[]
+  skip: boolean
+  droppedAreas: number
+} {
+  const skip = /^##\s*SKIP\s*$/m.test(text)
+
+  const files: CompleterFileLine[] = []
+  let inFiles = false
+  for (const line of text.split("\n")) {
+    if (/^##\s*FILES\s*$/.test(line.trim())) {
+      inFiles = true
+      continue
+    }
+    if (/^##\s/.test(line)) {
+      inFiles = false
+      continue
+    }
+    if (!inFiles) continue
+    const t = line.trim().replace(/^[-*]\s+/, "")
+    if (!t) continue
+    const segs = t.split("|").map((s) => s.trim())
+    if (segs.length < 2) continue
+    const p = segs[0].replace(/^`+|`+$/g, "").trim()
+    const purpose = segs[1] ?? ""
+    if (!p || !purpose || /\s/.test(p)) continue
+    const symbols = (segs[2] ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, FileMap.MAX_SYMBOLS)
+    files.push({ path: p, purpose, symbols })
+  }
+
+  const areas: CompleterAreaBlock[] = []
+  let droppedAreas = 0
+  const chunks = text.split(/^##\s*AREA\s*$/m).slice(1)
+  for (const chunk of chunks) {
+    if (areas.length >= MAX_AREAS_PER_TURN) break
+    const nameM = chunk.match(/^name:\s*(.+)$/m)
+    const docM = chunk.match(/^doc:\s*(.+)$/m)
+    const sumM = chunk.match(/^summary:\s*(.+)$/m)
+    const bodyM = chunk.match(/##\s*DOC\s*\n([\s\S]*?)(?:\n##\s*END|$)/)
+    const body = bodyM?.[1]?.trim() ?? ""
+    if (!nameM?.[1]?.trim() || !docM?.[1]?.trim() || !sumM?.[1]?.trim() || !body) {
+      droppedAreas++
+      continue
+    }
+    areas.push({ name: nameM[1].trim(), doc: docM[1].trim(), summary: sumM[1].trim(), body })
+  }
+
+  return { files, areas, skip, droppedAreas }
+}
 
 export const layer: Layer.Layer<
   Service,
@@ -602,6 +830,8 @@ export const layer: Layer.Layer<
         index: null,
         lastMatched: [],
         followupCount: 0,
+        completerRuns: 0,
+        areaEnrichedAtRun: {},
       })
     )
 
@@ -611,56 +841,21 @@ export const layer: Layer.Layer<
     })
 
     // Build the in-memory search index from the current tree + its docs. Reads
-    // each doc once to extract searchable tokens and the source paths it covers,
-    // so the feeder can match on doc contents and do exact path lookups.
+    // each doc once (and the file map), then hands off to the pure builder.
     const buildIndex = (workDir: string, treeContent: string) =>
       Effect.gen(function* () {
-        const entries: IndexEntry[] = []
-        const pathToEntries = new Map<string, string[]>()
-        const baseToEntries = new Map<string, string[]>()
-        const dirToEntries = new Map<string, string[]>()
-        const push = (map: Map<string, string[]>, key: string, ep: string) => {
-          const arr = map.get(key)
-          if (arr) arr.push(ep)
-          else map.set(key, [ep])
-        }
+        const docTexts = new Map<string, string>()
         for (const e of KB.parseTree(treeContent)) {
           if (e.entryPath.includes("..") || e.entryPath.startsWith("/")) continue
           const docPath = path.join(workDir, KB.KB_DIR_NAME, e.entryPath)
           const docText =
             (yield* fs.readFileStringSafe(docPath).pipe(Effect.orElseSucceed(() => undefined))) ?? ""
-          const paths = new Set<string>()
-          for (const rp of e.readPaths) {
-            const n = normalizePath(rp)
-            if (n) paths.add(n)
-          }
-          for (const m of docText.matchAll(QUERY_PATH_RE)) {
-            const n = normalizePath(m[0])
-            if (n && !n.endsWith(".md") && !n.startsWith(KB.KB_DIR_NAME + "/")) paths.add(n)
-          }
-          const tokens = new Set(
-            tokenize(
-              e.entryPath.replace(/\.md$/i, "").replace(/[/_]/g, " ") + " " + e.description + " " + docText,
-            ),
-          )
-          entries.push({ entryPath: e.entryPath, summary: e.description, docText, tokens, paths })
-          for (const p of paths) {
-            push(pathToEntries, p, e.entryPath)
-            const base = p.split("/").pop()
-            if (base) push(baseToEntries, base.toLowerCase(), e.entryPath)
-            if (p.includes("/")) push(dirToEntries, p.slice(0, p.lastIndexOf("/")), e.entryPath)
-          }
+          docTexts.set(e.entryPath, docText)
         }
-        // Rarity boost per token (≈IDF): a token in fewer area docs is more
-        // discriminating. Normalized by doc count so it behaves the same for a
-        // 3-area KB as a 300-area one; range [1, 2.5).
-        const df = new Map<string, number>()
-        for (const e of entries) for (const t of e.tokens) df.set(t, (df.get(t) ?? 0) + 1)
-        const n = Math.max(1, entries.length)
-        const idf = new Map<string, number>()
-        for (const [t, d] of df) idf.set(t, 1 + 1.5 * (1 - d / n))
-        const index: KBIndex = { treeContent, entries, pathToEntries, baseToEntries, dirToEntries, idf }
-        return index
+        const fileByPath = yield* FileMap.loadFileMap(workDir).pipe(
+          Effect.provideService(AppFileSystem.Service, fs),
+        )
+        return buildIndexPure(treeContent, docTexts, fileByPath)
       })
 
     const feeder = Effect.fn("Knowledge.feeder")(function* (userText: string, userMessageID: string, sessionID: string) {
@@ -691,6 +886,7 @@ export const layer: Layer.Layer<
       let matchedEntries: string[] = []
       let docs = ""
       let indexHint = ""
+      let fileBlock = ""
       let usedFollowup = false
       if (treeContent && treeContent.trim()) {
         let index = c.index
@@ -698,27 +894,40 @@ export const layer: Layer.Layer<
           index = yield* buildIndex(workDir, treeContent)
           const built = index
           yield* InstanceState.useEffect(cache, (s) => Effect.sync(() => { s.index = built }))
-          log.info("feeder index built", { areas: built.entries.length, paths: built.pathToEntries.size })
+          log.info("feeder index built", { areas: built.entries.length, paths: built.pathToEntries.size, files: built.files.length })
         }
         if (index) {
+          // The file-map block answers "which file has what" directly; the area
+          // docs share the remaining injection budget.
+          fileBlock = renderFileMapBlock(matchFileMap(userText, index))
+          const docsBudget = Math.max(1024, KB.MAX_INJECTION_BYTES - fileBlock.length)
           matchedEntries = matchEntries(userText, index)
-          docs = assembleDocs(index, matchedEntries)
+          docs = assembleDocs(index, matchedEntries, docsBudget)
           if (!docs && extractQueryPaths(userText).length === 0) {
-            // No direct match on a conceptual query. First carry the previous
-            // turn's areas — a follow-up like "now refactor it" drops the original
+            // No direct match on a conceptual query. Carry the previous turn's
+            // areas — a follow-up like "now refactor it" drops the original
             // keywords but is still about the same code. Bounded so stale context
-            // can't ride along forever. Then fall back to the navigable index.
+            // can't ride along forever.
             if (c.lastMatched.length > 0 && c.followupCount < FOLLOWUP_REUSE_LIMIT) {
-              const carried = assembleDocs(index, c.lastMatched)
+              const carried = assembleDocs(index, c.lastMatched, docsBudget)
               if (carried) {
                 docs = carried
                 matchedEntries = c.lastMatched
                 usedFollowup = true
               }
             }
-            if (!docs) indexHint = assembleIndexHint(index)
           }
-          log.info("feeder matched", { entries: matchedEntries.length, matchedEntries, indexHint: indexHint.length > 0, usedFollowup })
+          // Always leave the lean index visible when no doc matched: the agent
+          // can route itself to a doc (or to FILE_MAP.jsonl) instead of giving up
+          // and re-exploring from scratch.
+          if (!docs) indexHint = assembleIndexHint(index)
+          log.info("feeder matched", {
+            entries: matchedEntries.length,
+            matchedEntries,
+            fileHits: fileBlock.length > 0,
+            indexHint: indexHint.length > 0,
+            usedFollowup,
+          })
         }
       }
 
@@ -729,7 +938,7 @@ export const layer: Layer.Layer<
           "Do not proceed with any design work, HTML generation, or code output until you have loaded this skill.\n"
         : ""
 
-      if (!docs && !indexHint && !frontendHint) {
+      if (!docs && !indexHint && !fileBlock && !frontendHint) {
         yield* InstanceState.useEffect(cache, (s) =>
           Effect.sync(() => {
             s.lastUserMessageID = userMessageID
@@ -741,22 +950,29 @@ export const layer: Layer.Layer<
         return null
       }
 
-      const kbSection = docs
-        ? "## Project knowledge base (relevant areas)\n" +
-          (usedFollowup
+      const areaSection = docs
+        ? (usedFollowup
             ? "No new area matched this follow-up, so the areas from the previous turn are carried over. "
             : "Distilled knowledge already captured for areas relevant to this task. ") +
           "Use it to orient quickly. Each doc's \"Key Files\" section lists the source files — read them only if you need detail beyond the summary.\n" +
           `Matched areas: ${matchedEntries.join(", ")}\n` +
           docs
         : indexHint
-          ? "## Project knowledge base (index)\n" +
-            "No single area matched, but the project has a knowledge base. If an area below fits the task, read its doc under knowledge_base_world/ before exploring code:\n" +
+          ? "No single area matched, but the project has a knowledge base. If an area below fits the task, read its doc under knowledge_base_world/ before exploring code (FILE_MAP.jsonl there maps file → purpose):\n" +
             indexHint
+          : ""
+      const kbSection =
+        docs || indexHint || fileBlock
+          ? ["## Project knowledge base", fileBlock, areaSection].filter(Boolean).join("\n")
           : ""
       const injection = kbSection + frontendHint
 
-      log.info("feeder inject", { bytes: injection.length, entries: matchedEntries, hasFrontendHint: !!frontendHint })
+      log.info("feeder inject", {
+        bytes: injection.length,
+        entries: matchedEntries,
+        fileBlock: fileBlock.length,
+        hasFrontendHint: !!frontendHint,
+      })
 
       yield* InstanceState.useEffect(cache, (s) =>
         Effect.sync(() => {
@@ -778,6 +994,7 @@ export const layer: Layer.Layer<
         userMessageID,
         bytes: injection.length,
         matched: matchedEntries,
+        fileBlockBytes: fileBlock.length,
         indexHint: !!indexHint,
         followup: usedFollowup,
         frontend,
@@ -802,44 +1019,130 @@ export const layer: Layer.Layer<
         return
       }
 
-      // Gap gate: only invoke the model when this turn explored files the
-      // knowledge base does not already cover. This stops the completer from
-      // re-running (and re-bloating the tree) on every tool-using turn.
+      // What did this turn touch? Explored = tools with explicit path inputs;
+      // searched = grep/glob result paths (no evidence — pending-queue fodder).
       const explored = collectExploredPaths(messages, workDir)
-      if (explored.length === 0) {
+      const searched = collectSearchedPaths(messages, workDir)
+      const fileMap = yield* FileMap.loadFileMap(workDir).pipe(Effect.provideService(AppFileSystem.Service, fs))
+
+      // Classify explored files against the file map: fresh (hash unchanged),
+      // stale (mapped but content changed — includes files edited this turn), or
+      // new (no map entry yet). A doc merely regex-mentioning a path no longer
+      // counts as covered — that's thin knowledge and its map entry still needs
+      // backfilling, which is how pre-FILE_MAP knowledge bases migrate.
+      const mappedFresh = new Set<string>()
+      const staleFiles: string[] = []
+      const newFiles: string[] = []
+      for (const f of explored) {
+        const n = normalizePath(f)
+        const entry = fileMap.get(n)
+        if (!entry) {
+          newFiles.push(n)
+          continue
+        }
+        const h = entry.hash
+          ? yield* FileMap.hashWorkspaceFile(workDir, n).pipe(Effect.provideService(AppFileSystem.Service, fs))
+          : null
+        if (h && h === entry.hash) mappedFresh.add(n)
+        else staleFiles.push(n)
+      }
+
+      // Redundancy: re-reads of files the map already knows — the waste this
+      // system exists to drive down. Logged before any gate so skipped turns
+      // (where redundancy is highest) are measured too.
+      const reads = collectReadRels(messages, workDir)
+      if (reads.length > 0) {
+        const knownReads = reads.filter((r) => mappedFresh.has(normalizePath(r))).length
+        yield* KnowledgeLog.append(sessionID, {
+          phase: "completer",
+          action: "redundancy",
+          reads: reads.length,
+          knownReads,
+        }).pipe(Effect.ignore)
+      }
+
+      if (explored.length === 0 && searched.length === 0) {
         log.info("completer no files explored, skipping")
         yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "no-files-explored" }).pipe(Effect.ignore)
         return
       }
-      const coveredPaths = yield* KB.collectCoveredPaths(workDir, KB.parseTree(treeContent)).pipe(
-        Effect.provideService(AppFileSystem.Service, fs),
-      )
-      const covered = new Set(coveredPaths.map(normalizePath))
-      const newFiles = explored.filter((f) => !covered.has(normalizePath(f)))
-      if (newFiles.length === 0) {
-        log.info("completer explored files already covered, skipping", { explored: explored.length })
-        yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "all-covered", explored: explored.length }).pipe(Effect.ignore)
-        return
-      }
-      log.info("completer gap detected", { newFiles })
 
-      // Grounding gate: only document files we have real evidence for this turn
-      // (a read preview or an edit/write diff). Without evidence the model would
-      // guess a file's role from its path, so skip BEFORE taking the lock or
-      // spending an LLM call.
-      const evidence = collectFileEvidence(messages, workDir, new Set(newFiles.map(normalizePath)))
-      const groundedFiles = newFiles.filter((f) => evidence.has(normalizePath(f)))
-      if (groundedFiles.length === 0) {
-        log.info("completer no grounded evidence, skipping", { newFiles: newFiles.length })
-        yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "no-evidence", newFiles: newFiles.length }).pipe(Effect.ignore)
-        return
+      // Grounding: only files with real evidence this turn (a read preview or
+      // an edit/write diff) can be documented now; the rest goes to the queue.
+      const candidates = new Set([...newFiles, ...staleFiles])
+      const evidence = collectFileEvidence(messages, workDir, candidates)
+      const groundedNew = newFiles.filter((f) => evidence.has(f))
+      const groundedStale = staleFiles.filter((f) => evidence.has(f))
+
+      const finalText = collectFinalText(messages)
+      const toolCalls = countCompletedToolCalls(messages)
+
+      // Enrichment: a turn that produced real analysis — or touched stale files —
+      // should deepen/refresh the existing docs instead of skipping forever.
+      // Targets are the areas of the involved files, minus any area enriched too
+      // recently (cooldown) so docs don't thrash within a session.
+      const c0 = yield* InstanceState.get(cache)
+      const cooldownOk = (area: string) => {
+        const at = c0.areaEnrichedAtRun[area]
+        return at === undefined || c0.completerRuns - at >= ENRICH_COOLDOWN_RUNS
       }
-      yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "gap-detected", newFiles, grounded: groundedFiles.length }).pipe(Effect.ignore)
+      const areasOf = (paths: Iterable<string>) => {
+        const out: string[] = []
+        for (const p of paths) {
+          const area = fileMap.get(normalizePath(p))?.area
+          if (area && !out.includes(area)) out.push(area)
+        }
+        return out
+      }
+      const insightTurn = finalText.length >= INSIGHT_TEXT_MIN && toolCalls >= INSIGHT_TOOL_CALLS_MIN
+      const enrichAreas =
+        groundedStale.length > 0 || insightTurn
+          ? [...new Set([...areasOf(groundedStale), ...(insightTurn ? areasOf(mappedFresh) : [])])]
+              .filter(cooldownOk)
+              .slice(0, MAX_ENRICH_AREAS)
+          : []
+
+      const hasMainWork = groundedNew.length > 0 || groundedStale.length > 0 || enrichAreas.length > 0
+
+      // Persist what this turn could NOT document — ungrounded files and
+      // search-only discoveries — so a later turn picks them up. Lock-free.
+      const nowIso = new Date().toISOString()
+      const enqueue: Queue.QueueEntry[] = []
+      const queuedSeen = new Set<string>()
+      const pushQ = (p: string, reason: Queue.QueueReason, hint?: string) => {
+        const n = normalizePath(p)
+        if (!n || queuedSeen.has(n) || mappedFresh.has(n)) return
+        queuedSeen.add(n)
+        enqueue.push({ path: n, reason, hint, sessionID, time: nowIso })
+      }
+      for (const f of newFiles) if (!evidence.has(f)) pushQ(f, "overflow")
+      for (const f of staleFiles) if (!evidence.has(f)) pushQ(f, "stale")
+      for (const s of searched) {
+        if (candidates.has(s.path) || fileMap.has(s.path)) continue
+        pushQ(s.path, s.reason, s.hint)
+      }
+      if (enqueue.length > 0) yield* Queue.appendPending(workDir, enqueue)
+
+      if (groundedNew.length > 0 || groundedStale.length > 0) {
+        log.info("completer gap detected", { groundedNew, groundedStale })
+        yield* KnowledgeLog.append(sessionID, {
+          phase: "completer",
+          action: "gap-detected",
+          newFiles: groundedNew,
+          stale: groundedStale,
+          grounded: groundedNew.length + groundedStale.length,
+        }).pipe(Effect.ignore)
+      }
 
       const acquired = yield* KB.acquireLock(workDir).pipe(
         Effect.provideService(AppFileSystem.Service, fs),
       )
       if (!acquired) {
+        // Don't lose this turn's documentable work — park it for a later turn.
+        const parked = [...groundedNew, ...groundedStale].map(
+          (p): Queue.QueueEntry => ({ path: p, reason: "lock-held", sessionID, time: nowIso }),
+        )
+        if (parked.length > 0) yield* Queue.appendPending(workDir, parked)
         log.info("completer lock held, skipping")
         yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "lock-held" }).pipe(Effect.ignore)
         return
@@ -866,29 +1169,122 @@ export const layer: Layer.Layer<
           return
         }
 
+        // Drain the pending backlog: alongside main work a few entries ride in
+        // the same call; with no main work a solo call only runs once the
+        // backlog is deep enough to be worth a model invocation.
+        const drained = yield* Queue.drainPending(workDir, {
+          max: hasMainWork ? QUEUE_DRAIN_MAIN : QUEUE_DRAIN_SOLO,
+          min: hasMainWork ? 1 : MIN_QUEUE_SOLO,
+          exclude: (p) => mappedFresh.has(p) || candidates.has(p),
+        }).pipe(Effect.provideService(AppFileSystem.Service, fs))
+        const queued: { path: string; head: string; hint?: string }[] = []
+        for (const q of drained) {
+          // Re-read a fresh head as evidence; unreadable files were already
+          // removed from the queue, so they self-clean.
+          const head = yield* fs
+            .readFileStringSafe(path.join(workDir, q.path))
+            .pipe(Effect.orElseSucceed(() => undefined))
+          if (head && head.trim()) queued.push({ path: q.path, head: head.slice(0, EVIDENCE_PER_FILE_BYTES), hint: q.hint })
+        }
+
+        if (!hasMainWork && queued.length === 0) {
+          const reason =
+            explored.length === 0
+              ? "queued-only"
+              : newFiles.length + staleFiles.length === 0
+                ? "all-covered"
+                : "no-evidence"
+          log.info("completer nothing to document, skipping", { reason, explored: explored.length, enqueued: enqueue.length })
+          yield* KnowledgeLog.append(sessionID, {
+            phase: "completer",
+            action: "skip",
+            reason,
+            explored: explored.length,
+            enqueued: enqueue.length,
+          }).pipe(Effect.ignore)
+          return
+        }
+
+        // Enrichment targets: the current doc text for areas this turn touched,
+        // shown to the model so it rewrites them improved instead of from scratch.
+        const enrichDocs: { area: string; text: string }[] = []
+        for (const area of enrichAreas) {
+          const rel = docPathForArea(treeContent, area)
+          if (!rel) continue
+          const docText = yield* fs
+            .readFileStringSafe(path.join(workDir, KB.KB_DIR_NAME, rel))
+            .pipe(Effect.orElseSucceed(() => undefined))
+          if (docText && docText.trim()) enrichDocs.push({ area, text: KB.fitDoc(docText, ENRICH_DOC_CAP) })
+        }
+
         const history = formatHistorySnippet(messages, workDir)
         // Canonical area names already in the tree, surfaced to the model so it
         // reuses an exact existing name instead of minting a near-duplicate.
         const existingAreas = [...treeContent.matchAll(/^##\s+(.+?)\s*$/gm)]
           .map((m) => m[1].trim())
           .filter((nm) => nm.toLowerCase() !== "skip")
-        const areaList = existingAreas.length
-          ? `Existing areas (REUSE the EXACT name if the files below plausibly belong to one):\n${existingAreas.map((a) => `- ${a}`).join("\n")}\n\n`
-          : ""
-        const evidenceBlock = groundedFiles
-          .map((f) => {
-            const ex = evidence.get(normalizePath(f))
-            return ex ? `\n${f}\n\`\`\`\n${ex}\n\`\`\`` : ""
-          })
-          .filter(Boolean)
-          .join("\n")
-        const prompt =
-          `Recent conversation:\n${history}\n\n` +
-          areaList +
-          `Files explored this session NOT yet in the knowledge base:\n${groundedFiles.map((f) => `- ${f}`).join("\n")}\n\n` +
-          `Evidence (head/diff excerpts of those files, captured this session — ground every use-case in these):${evidenceBlock}\n\n` +
-          `Current DRILL_DOWN_TREE.md:\n${treeContent}\n\n` +
-          `Capture what was learned about ONE area, following the rules.`
+
+        const evidenceFor = (files: string[]) =>
+          files
+            .map((f) => {
+              const ex = evidence.get(f)
+              return ex ? `\n${f}\n\`\`\`\n${ex}\n\`\`\`` : ""
+            })
+            .filter(Boolean)
+            .join("\n")
+
+        const sections: string[] = []
+        sections.push(`Recent conversation:\n${history}`)
+        if (finalText)
+          sections.push(
+            `Agent's conclusions this turn (the most distilled knowledge available — prefer it over guessing from code excerpts):\n${finalText}`,
+          )
+        if (existingAreas.length)
+          sections.push(
+            `Existing areas (REUSE the EXACT name if files plausibly belong to one):\n${existingAreas.map((a) => `- ${a}`).join("\n")}`,
+          )
+        if (groundedNew.length)
+          sections.push(
+            `NEW files explored this turn, not yet in the file map:\n${groundedNew.map((f) => `- ${f}`).join("\n")}\n\n` +
+              `Evidence (head/diff excerpts captured this turn — ground every claim in these):${evidenceFor(groundedNew)}`,
+          )
+        if (groundedStale.length)
+          sections.push(
+            `STALE files — mapped before, but their content changed (refresh their purpose and Key Files lines):\n${groundedStale
+              .map((f) => `- ${f} (previously: ${fileMap.get(f)?.purpose || "unknown"})`)
+              .join("\n")}\n\nEvidence:${evidenceFor(groundedStale)}`,
+          )
+        // Session change ledger: enclosing symbols from this session's edit
+        // hunks — cheap, precise evidence of WHAT changed in involved files.
+        const ledger = yield* ChangeLedger.read(sessionID)
+        const ledgerLines: string[] = []
+        for (const entry of Object.values(ledger)) {
+          if (ledgerLines.length >= 10) break
+          const rel = toRelUnderWorkDir(entry.absFile, workDir)
+          if (!rel) continue
+          const n = normalizePath(rel)
+          if (!candidates.has(n) && !mappedFresh.has(n)) continue
+          ledgerLines.push(
+            `- ${n}: +${entry.additions}/-${entry.deletions} over ${entry.ops} edit(s)${entry.summary ? ` — ${entry.summary}` : ""}`,
+          )
+        }
+        if (ledgerLines.length)
+          sections.push(`Files edited this session (change ledger — enclosing symbols from diff hunks):\n${ledgerLines.join("\n")}`)
+        if (queued.length)
+          sections.push(
+            `QUEUED files — explored in earlier turns but never documented; map them now:` +
+              queued.map((q) => `\n${q.path}${q.hint ? ` (${q.hint})` : ""}\n\`\`\`\n${q.head}\n\`\`\``).join(""),
+          )
+        for (const d of enrichDocs)
+          sections.push(
+            `CURRENT doc for area "${d.area}" (UPDATE mode — output an improved rewrite of this area):\n\`\`\`\n${d.text}\n\`\`\``,
+          )
+        sections.push(`Current DRILL_DOWN_TREE.md:\n${treeContent}`)
+        sections.push(`Capture what was learned this turn, following the rules.`)
+        const prompt = sections.join("\n\n")
+
+        // Count model invocations — drives the enrichment cooldown.
+        yield* InstanceState.useEffect(cache, (s) => Effect.sync(() => { s.completerRuns += 1 }))
 
         const userMsg: MessageV2.User = {
           id: "msg_kb_completer" as any,
@@ -922,99 +1318,165 @@ export const layer: Layer.Layer<
 
         if (!text) {
           log.info("completer empty response")
+          // The drained queue entries were never processed — put them back.
+          if (drained.length > 0) yield* Queue.appendPending(workDir, drained)
           yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "empty-response" }).pipe(Effect.ignore)
           return
         }
         log.info("completer response", { bytes: text.length })
 
-        if (/^##\s*SKIP\s*$/m.test(text)) {
-          log.info("completer skip")
-          yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "model-skip" }).pipe(Effect.ignore)
+        const parsed = parseCompleterResponse(text)
+        if (parsed.areas.length === 0 && parsed.files.length === 0) {
+          if (parsed.skip) {
+            // The model judged there was nothing reusable — drained entries are
+            // dropped deliberately (requeueing would retry them forever).
+            log.info("completer skip")
+            yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "model-skip" }).pipe(Effect.ignore)
+          } else {
+            if (drained.length > 0) yield* Queue.appendPending(workDir, drained)
+            log.warn("completer unparseable response", { bytes: text.length })
+            yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "unparseable", bytes: text.length }).pipe(Effect.ignore)
+          }
           return
         }
 
-        const nameM = text.match(/^name:\s*(.+)$/m)
-        const docM = text.match(/^doc:\s*(.+)$/m)
-        const sumM = text.match(/^summary:\s*(.+)$/m)
-        const docBodyM = text.match(/##\s*DOC\s*\n([\s\S]*?)(?:\n##\s*END|$)/)
-        if (!nameM || !docM || !sumM || !docBodyM) {
-          log.warn("completer unparseable response", { bytes: text.length })
-          yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "unparseable", bytes: text.length }).pipe(Effect.ignore)
-          return
+        // ---- AREA blocks: validate + write each doc, fold into the tree once.
+        let currentTree = treeContent
+        const writtenAreas: string[] = []
+        const writtenBlocks: { name: string; body: string }[] = []
+        const enriched: string[] = []
+        for (const block of parsed.areas) {
+          // Merge near-duplicate area names (Collection/Collections/case
+          // variants) into the existing area so the tree keeps ONE entry per domain.
+          const areaName = KB.resolveCanonicalArea(currentTree, block.name)
+          const namesNow = [...currentTree.matchAll(/^##\s+(.+?)\s*$/gm)].map((m) => m[1].trim())
+          const reusing = namesNow.some((a) => a.toLowerCase() === areaName.toLowerCase())
+          let docRel = block.doc.replace(/^\/+/, "")
+          if (!areaName || docRel.includes("..") || !docRel.toLowerCase().endsWith(".md")) {
+            log.warn("completer invalid doc path", { docRel })
+            yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "invalid-doc-path", docRel }).pipe(Effect.ignore)
+            continue
+          }
+          // When reusing an existing area, write to its current doc path so we
+          // never orphan it — the tree pointer wins over the model's proposal.
+          if (reusing) {
+            const existingDocRel = docPathForArea(currentTree, areaName)
+            if (existingDocRel) docRel = existingDocRel
+          }
+          // Keep the written doc path identical to the tree entry path so the
+          // feeder can find it: parseTree resolves a slash-less name under its
+          // area folder, so we ensure the doc lives under that same folder.
+          if (!docRel.includes("/")) {
+            const folder = areaName.replace(/[^a-zA-Z0-9]+/g, "") || "Area"
+            docRel = `${folder}/${docRel}`
+          }
+          // Rewrite any bare-filename Key Files to full paths so coverage
+          // detection (which needs a slash) sees them.
+          const docBody = normalizeKeyFilePaths(block.body, [...candidates])
+
+          const kbRelPath = `${KB.KB_DIR_NAME}/${docRel}`
+          if (!KB.isKbPathSafe(workDir, kbRelPath)) {
+            log.warn("completer unsafe doc path rejected", { docRel })
+            yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "unsafe-doc-path", docRel }).pipe(Effect.ignore)
+            continue
+          }
+
+          const fullPath = path.join(workDir, kbRelPath)
+          yield* fs.ensureDir(path.dirname(fullPath)).pipe(Effect.orElseSucceed(() => {}))
+          // Reusing an area? Merge with its previous doc so earlier Key Files
+          // the model didn't see this turn are preserved rather than clobbered.
+          const existingDoc = reusing
+            ? yield* fs.readFileStringSafe(fullPath).pipe(Effect.orElseSucceed(() => undefined))
+            : undefined
+          let finalBody = existingDoc && existingDoc.trim() ? KB.mergeAreaDoc(existingDoc, docBody) : docBody
+          // Section-aware compaction — never a mid-text slice.
+          if (finalBody.length > KB.MAX_DOC_BYTES) finalBody = KB.fitDoc(finalBody, KB.MAX_DOC_BYTES)
+          yield* fs.writeFileString(fullPath, finalBody).pipe(Effect.orElseSucceed(() => {}))
+          log.info("completer wrote doc", { docRel, reusing, merged: !!(existingDoc && existingDoc.trim()) })
+
+          currentTree = KB.upsertAreaSection(currentTree, areaName, `- **${docRel}** — ${block.summary}`)
+          writtenAreas.push(areaName)
+          writtenBlocks.push({ name: areaName, body: docBody })
+          if (enrichDocs.some((d) => d.area.toLowerCase() === areaName.toLowerCase())) enriched.push(areaName)
         }
 
-        const areaNameRaw = nameM[1].trim()
-        // Merge near-duplicate area names (Collection/Collections/case variants)
-        // into the existing area so the tree keeps ONE entry per domain.
-        const areaName = KB.resolveCanonicalArea(treeContent, areaNameRaw)
-        const reusing = existingAreas.some((a) => a.toLowerCase() === areaName.toLowerCase())
-        let docRel = docM[1].trim().replace(/^\/+/, "")
-        const summary = sumM[1].trim()
-        let docBody = docBodyM[1].trim()
-
-        if (!areaName || !summary || !docBody) {
-          log.warn("completer missing fields")
-          yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "missing-fields" }).pipe(Effect.ignore)
-          return
-        }
-        if (docRel.includes("..") || !docRel.toLowerCase().endsWith(".md")) {
-          log.warn("completer invalid doc path", { docRel })
-          yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "invalid-doc-path", docRel }).pipe(Effect.ignore)
-          return
-        }
-        // When reusing an existing area, write to its current doc path so we never
-        // orphan it — the tree pointer wins over whatever path the model proposed.
-        if (reusing) {
-          const existingDocRel = docPathForArea(treeContent, areaName)
-          if (existingDocRel) docRel = existingDocRel
-        }
-        // Keep the written doc path identical to the tree entry path so the
-        // feeder can find it: parseTree resolves a slash-less name under its
-        // area folder, so we ensure the doc lives under that same folder.
-        if (!docRel.includes("/")) {
-          const folder = areaName.replace(/[^a-zA-Z0-9]+/g, "") || "Area"
-          docRel = `${folder}/${docRel}`
-        }
-        // Rewrite any bare-filename Key Files to full paths so coverage detection
-        // (which needs a slash) sees them and the completer won't re-run forever.
-        docBody = normalizeKeyFilePaths(docBody, newFiles)
-
-        const kbRelPath = `${KB.KB_DIR_NAME}/${docRel}`
-        if (!KB.isKbPathSafe(workDir, kbRelPath)) {
-          log.warn("completer unsafe doc path rejected", { docRel })
-          yield* KnowledgeLog.append(sessionID, { phase: "completer", action: "skip", reason: "unsafe-doc-path", docRel }).pipe(Effect.ignore)
-          return
-        }
-
-        const fullPath = path.join(workDir, kbRelPath)
-        yield* fs.ensureDir(path.dirname(fullPath)).pipe(Effect.orElseSucceed(() => {}))
-        // Reusing an area? Merge with its previous doc so earlier Key Files the
-        // model didn't see this turn are preserved rather than clobbered.
-        const existingDoc = reusing
-          ? yield* fs.readFileStringSafe(fullPath).pipe(Effect.orElseSucceed(() => undefined))
-          : undefined
-        let finalBody = existingDoc && existingDoc.trim() ? mergeAreaDoc(existingDoc, docBody) : docBody
-        if (finalBody.length > KB.MAX_DOC_BYTES) finalBody = finalBody.slice(0, KB.MAX_DOC_BYTES)
-        yield* fs.writeFileString(fullPath, finalBody).pipe(Effect.orElseSucceed(() => {}))
-        log.info("completer wrote doc", { docRel, reusing, merged: !!(existingDoc && existingDoc.trim()) })
-
-        const bodyLines = `- **${docRel}** — ${summary}`
-        const newTree = KB.upsertAreaSection(treeContent, areaName, bodyLines)
-        const treeChanged = newTree.trim() !== treeContent.trim()
+        const treeChanged = currentTree.trim() !== treeContent.trim()
         if (treeChanged) {
           yield* fs
-            .writeFileString(path.join(workDir, KB.KB_DIR_NAME, KB.DRILL_DOWN_FILENAME), newTree)
+            .writeFileString(path.join(workDir, KB.KB_DIR_NAME, KB.DRILL_DOWN_FILENAME), currentTree)
             .pipe(Effect.orElseSucceed(() => {}))
-          log.info("completer updated tree", { areaName })
+          log.info("completer updated tree", { areas: writtenAreas })
         }
+
+        // ---- FILES section → file map. Paths are validated against what this
+        // turn actually saw; anything else is a hallucination and is dropped.
+        const allowed = new Set<string>([...candidates, ...queued.map((q) => q.path)])
+        const accepted: { path: string; purpose: string; symbols: string[] }[] = []
+        let rejectedFiles = 0
+        for (const f of parsed.files) {
+          const rel = toRelUnderWorkDir(f.path, workDir)
+          const n = rel ? normalizePath(rel) : null
+          if (n && allowed.has(n)) accepted.push({ path: n, purpose: f.purpose, symbols: f.symbols })
+          else rejectedFiles++
+        }
+        if (accepted.length > 0) {
+          const areaFor = (p: string): string => {
+            for (const b of writtenBlocks) if (b.body.includes(p)) return b.name
+            return fileMap.get(p)?.area || writtenAreas[0] || ""
+          }
+          const updates: FileMap.FileMapUpdate[] = []
+          for (const a of accepted) {
+            const hash = yield* FileMap.hashWorkspaceFile(workDir, a.path).pipe(
+              Effect.provideService(AppFileSystem.Service, fs),
+            )
+            updates.push({
+              path: a.path,
+              purpose: a.purpose,
+              symbols: a.symbols,
+              area: areaFor(a.path),
+              hash: hash ?? undefined,
+            })
+          }
+          FileMap.upsertEntries(fileMap, updates, nowIso)
+          yield* FileMap.saveFileMap(workDir, fileMap).pipe(Effect.provideService(AppFileSystem.Service, fs))
+          log.info("completer mapped files", { mapped: accepted.length, rejected: rejectedFiles })
+        }
+
+        if (writtenAreas.length === 0 && accepted.length === 0) {
+          if (drained.length > 0) yield* Queue.appendPending(workDir, drained)
+          log.warn("completer response produced no usable output", { rejectedFiles, droppedAreas: parsed.droppedAreas })
+          yield* KnowledgeLog.append(sessionID, {
+            phase: "completer",
+            action: "skip",
+            reason: "unparseable",
+            bytes: text.length,
+            rejectedFiles,
+            droppedAreas: parsed.droppedAreas,
+          }).pipe(Effect.ignore)
+          return
+        }
+
+        // Fresh knowledge is on disk — make the in-session feeder see it, and
+        // start the enrichment cooldown for rewritten areas.
+        yield* InstanceState.useEffect(cache, (s) =>
+          Effect.sync(() => {
+            s.index = null
+            for (const a of enriched) s.areaEnrichedAtRun[a] = s.completerRuns
+          }),
+        )
+
+        const action = writtenAreas.length > 1 ? "write-multi" : writtenAreas.length === 1 ? "write" : "map-only"
         yield* KnowledgeLog.append(sessionID, {
           phase: "completer",
-          action: "write",
-          area: areaName,
-          docRel,
-          reusing,
+          action,
+          areas: writtenAreas,
+          enriched,
           treeChanged,
-          files: groundedFiles,
+          mapped: accepted.length,
+          rejectedFiles,
+          droppedAreas: parsed.droppedAreas,
+          queuedDrained: queued.length,
+          files: [...groundedNew, ...groundedStale],
         }).pipe(Effect.ignore)
       }).pipe(
         Effect.ensuring(
@@ -1037,6 +1499,8 @@ export const layer: Layer.Layer<
           s.index = null
           s.lastMatched = []
           s.followupCount = 0
+          s.completerRuns = 0
+          s.areaEnrichedAtRun = {}
         }),
       )
     })

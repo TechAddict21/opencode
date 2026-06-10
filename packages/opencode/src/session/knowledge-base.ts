@@ -36,10 +36,13 @@ Each area is a "## Area Name" header followed by one bullet:
 No areas captured yet — the knowledge completer adds them as the codebase is explored.
 `
 
-const _DEFAULT_GITIGNORE = `.kb.lock
-.kb.lock.d/
-*.kbtmp
-`
+// Transient KB-internal artifacts that must never be committed. ensureInit
+// seeds these for new KBs and appends any missing line to existing ones
+// (ensureFile never overwrites, so old KBs would otherwise never learn about
+// lines added later, e.g. the pending queue).
+const KB_GITIGNORE_LINES = [".kb.lock", ".kb.lock.d/", "*.kbtmp", ".pending.jsonl"]
+
+const _DEFAULT_GITIGNORE = KB_GITIGNORE_LINES.join("\n") + "\n"
 
 export interface TreeEntry {
   readonly entryPath: string
@@ -85,7 +88,10 @@ export function parseTree(content: string): TreeEntry[] {
       continue
     }
 
-    const em = stripped.match(/^-\s+\*{0,2}([^\s*]+\.md)\*{0,2}\s*[—–\-]\s*(.*)$/)
+    // Doc paths may contain spaces ("Storage & Persistence/Storage & Persistence.md")
+    // — the completer derives folder names from area names. Anything up to the
+    // first ".md" (asterisks excluded) is the path.
+    const em = stripped.match(/^-\s+\*{0,2}([^*]+?\.md)\*{0,2}\s*[—–\-]\s*(.*)$/)
     if (em && category) {
       flush()
       const rawPath = em[1]
@@ -248,11 +254,29 @@ export function ensureInit(
         }
       })
 
+    // Append any managed ignore line an existing KB's .gitignore is missing.
+    const migrateGitignore = Effect.gen(function* () {
+      const giPath = path.join(kbDir, ".gitignore")
+      const existing = yield* fs.readFileStringSafe(giPath).pipe(Effect.orElseSucceed(() => undefined))
+      if (existing === undefined) return
+      const have = new Set(
+        existing
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean),
+      )
+      const missing = KB_GITIGNORE_LINES.filter((l) => !have.has(l))
+      if (missing.length === 0) return
+      yield* fs.writeFileString(giPath, existing.replace(/\s+$/, "") + "\n" + missing.join("\n") + "\n")
+      log.info("kb gitignore migrated", { added: missing })
+    })
+
     const ok = yield* Effect.gen(function* () {
       yield* fs.ensureDir(kbDir)
       yield* ensureFile(path.join(kbDir, DRILL_DOWN_FILENAME), _DEFAULT_DRILL_DOWN)
       yield* ensureFile(path.join(kbDir, UNDERSTANDING_FILENAME), _DEFAULT_UNDERSTANDING)
       yield* ensureFile(path.join(kbDir, ".gitignore"), _DEFAULT_GITIGNORE)
+      yield* migrateGitignore
       return true
     }).pipe(
       Effect.tapError((error) => Effect.sync(() => log.error("failed to init knowledge_base_world", { error: String(error), kbDir }))),
@@ -319,4 +343,131 @@ export function isKbPathSafe(workDir: string, filePath: string): boolean {
   const fullPath = path.resolve(path.join(workDir, filePath))
   const relative = path.relative(kbDir, fullPath)
   return !relative.startsWith("..") && relative !== "" && filePath.startsWith(KB_DIR_NAME)
+}
+
+export const DOC_TRUNC_MARKER = "\n... [truncated — read the source files for more]"
+
+// Split a doc into its lead (text before the first "## " section, i.e. the
+// title + overview) and its "## "-level sections, each keeping its literal
+// heading line. Used to trim a doc by whole sections instead of mid-text.
+export function splitForFit(docText: string): { lead: string; sections: { title: string; body: string }[] } {
+  const lines = docText.split("\n")
+  const leadLines: string[] = []
+  const sections: { title: string; body: string[] }[] = []
+  let cur: { title: string; body: string[] } | null = null
+  for (const line of lines) {
+    if (/^##\s+.+/.test(line)) {
+      if (cur) sections.push(cur)
+      cur = { title: line.trimEnd(), body: [] }
+    } else if (cur) {
+      cur.body.push(line)
+    } else {
+      leadLines.push(line)
+    }
+  }
+  if (cur) sections.push(cur)
+  return {
+    lead: leadLines.join("\n").trim(),
+    sections: sections.map((s) => ({ title: s.title, body: s.body.join("\n").replace(/\s+$/, "") })),
+  }
+}
+
+// Trim one doc to `cap` bytes preserving the most useful content first: the
+// lead/overview, then "Key Files", then remaining sections in original order.
+// Whole sections are dropped rather than sliced mid-text; if Key Files itself
+// overflows it is cut at the last complete bullet so no half-path survives.
+export function fitDoc(docText: string, cap: number): string {
+  if (docText.length <= cap) return docText
+  const { lead, sections } = splitForFit(docText)
+  const keyIdx = sections.findIndex((s) => /\bfiles?\b/i.test(s.title))
+  const order: number[] = []
+  if (keyIdx >= 0) order.push(keyIdx)
+  sections.forEach((_, i) => {
+    if (i !== keyIdx) order.push(i)
+  })
+
+  let out = lead
+  if (out.length > cap) return out.slice(0, Math.max(0, cap - DOC_TRUNC_MARKER.length)) + DOC_TRUNC_MARKER
+
+  let truncated = false
+  for (const i of order) {
+    const sec = sections[i]
+    const block = sec.title + (sec.body ? "\n" + sec.body : "")
+    if (!block.trim()) continue
+    if (out.length + 1 + block.length <= cap) {
+      out += "\n" + block
+      continue
+    }
+    // Key Files is the highest-value section — salvage as many whole bullets as
+    // fit rather than dropping it entirely, but never emit a partial path.
+    if (i === keyIdx) {
+      const room = cap - out.length - 1 - sec.title.length - 1 - DOC_TRUNC_MARKER.length
+      const kept: string[] = []
+      let used = 0
+      for (const bullet of sec.body.split("\n")) {
+        if (used + bullet.length + 1 > room) break
+        kept.push(bullet)
+        used += bullet.length + 1
+      }
+      if (kept.length > 0) {
+        out += "\n" + sec.title + "\n" + kept.join("\n")
+      }
+    }
+    truncated = true
+    // keep scanning — a later, smaller section may still fit under the cap
+  }
+  if (truncated && !out.endsWith(DOC_TRUNC_MARKER)) out += DOC_TRUNC_MARKER
+  return out
+}
+
+const KEYFILE_PATH_RE = /(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z][\w]*/
+
+// Merge a freshly written area doc with the area's previous doc so REUSING an
+// existing area never silently loses its earlier Key Files. The new doc (with
+// its refreshed overview/notes) is the base; any prior Key-Files bullet whose
+// path the new doc omits is carried over.
+export function mergeAreaDoc(existingDoc: string, newDoc: string): string {
+  const keyFilesSection = (doc: string): { start: number; end: number; bullets: string[] } | null => {
+    const lines = doc.split("\n")
+    const start = lines.findIndex((l) => /^##\s+.*\bfiles?\b/i.test(l))
+    if (start < 0) return null
+    let end = lines.length
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/^##\s+/.test(lines[i])) {
+        end = i
+        break
+      }
+    }
+    const bullets = lines.slice(start + 1, end).filter((l) => /^-\s+/.test(l.trim()))
+    return { start, end, bullets }
+  }
+  const pathOf = (bullet: string): string | null => {
+    const m = bullet.match(KEYFILE_PATH_RE)
+    return m ? m[0].replace(/^\.\//, "").replace(/\/+$/, "").trim() : null
+  }
+
+  const oldSec = keyFilesSection(existingDoc)
+  if (!oldSec || oldSec.bullets.length === 0) return newDoc
+
+  const oldLines = existingDoc.split("\n")
+  const newSec = keyFilesSection(newDoc)
+  if (!newSec) {
+    // New doc has no Key Files section — append the old one wholesale.
+    return newDoc.replace(/\s+$/, "") + "\n\n" + oldLines[oldSec.start] + "\n" + oldSec.bullets.join("\n") + "\n"
+  }
+
+  const havePaths = new Set(newSec.bullets.map(pathOf).filter((p): p is string => !!p))
+  const carry = oldSec.bullets.filter((b) => {
+    const p = pathOf(b)
+    return p ? !havePaths.has(p) : false
+  })
+  if (carry.length === 0) return newDoc
+
+  const lines = newDoc.split("\n")
+  let insertAt = newSec.start + 1
+  for (let i = newSec.start + 1; i < newSec.end; i++) {
+    if (/^-\s+/.test(lines[i].trim())) insertAt = i + 1
+  }
+  lines.splice(insertAt, 0, ...carry)
+  return lines.join("\n")
 }
